@@ -1,65 +1,246 @@
-# 1. 强制检查 Root 权限
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ 错误: 请使用 'sudo -i' 切换到 root 用户后再运行此脚本！"
-  exit 1
-fi
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo ">>> [1/8] 正在更新系统并安装环境..."
-apt-get update -q
-apt-get install -y python3 python3-pip python3-flask curl socat
-
-echo ">>> [2/8] 正在安装 Sing-box..."
-bash <(curl -fsSL https://sing-box.app/deb-install.sh)
-
-echo ">>> [3/8] 创建项目目录..."
+### ========= 基本配置（可改） =========
 WORK_DIR="/root/sbox-relay"
-mkdir -p "$WORK_DIR/templates"
-cd "$WORK_DIR"
+PANEL_PORT="5000"
+SBOX_CONFIG="/etc/sing-box/config.json"
+LOG_FILE="/var/log/sbox-panel.log"
+SBOX_LOG="/var/log/sing-box.log"
+### ===================================
 
-echo ">>> [4/8] 生成 Reality 加密密钥..."
-# 重新生成密钥对
-KEYS=$(sing-box generate reality-keypair)
-PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey" | awk '{print $2}')
-PUBLIC_KEY=$(echo "$KEYS" | grep "PublicKey" | awk '{print $2}')
-SHORT_ID=$(openssl rand -hex 4)
-# 自动获取公网IP
-HOST_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
+_red(){ echo -e "\033[31m$*\033[0m"; }
+_grn(){ echo -e "\033[32m$*\033[0m"; }
+_ylw(){ echo -e "\033[33m$*\033[0m"; }
 
-echo "   - 公钥: $PUBLIC_KEY"
-echo "   - 本机IP: $HOST_IP"
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    _red "请用 root 运行：sudo -i 后再执行"
+    exit 1
+  fi
+}
 
-echo ">>> [5/8] 写入 Python 后端程序..."
-cat > "$WORK_DIR/app.py" <<EOF
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+  else
+    OS_ID="unknown"
+  fi
+  case "$OS_ID" in
+    ubuntu|debian) ;;
+    *)
+      _ylw "未识别系统为 Debian/Ubuntu（检测到: $OS_ID），仍尝试继续安装。"
+      ;;
+  esac
+}
+
+install_deps() {
+  _grn ">>> [1/9] 更新系统并安装依赖..."
+  apt-get update -q
+  apt-get install -y --no-install-recommends \
+    python3 python3-pip \
+    curl wget ca-certificates \
+    openssl \
+    socat \
+    jq
+  pip3 install --upgrade pip >/dev/null
+  pip3 install flask gunicorn >/dev/null
+}
+
+install_singbox() {
+  _grn ">>> [2/9] 安装 Sing-box..."
+  if command -v sing-box >/dev/null 2>&1; then
+    _ylw "Sing-box 已存在，跳过安装。"
+    return
+  fi
+  bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+}
+
+get_public_ip() {
+  # 多源兜底
+  HOST_IP="$(curl -fsS ifconfig.me 2>/dev/null || true)"
+  [[ -n "${HOST_IP}" ]] || HOST_IP="$(curl -fsS api.ipify.org 2>/dev/null || true)"
+  [[ -n "${HOST_IP}" ]] || HOST_IP="127.0.0.1"
+}
+
+gen_reality_keys() {
+  _grn ">>> [3/9] 生成 Reality 密钥..."
+  KEYS="$(sing-box generate reality-keypair)"
+  PRIVATE_KEY="$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')"
+  PUBLIC_KEY="$(echo "$KEYS"  | awk '/PublicKey/  {print $2}')"
+  SHORT_ID="$(openssl rand -hex 4)"
+  get_public_ip
+
+  _grn "   - 公钥(PBK): $PUBLIC_KEY"
+  _grn "   - ShortID  : $SHORT_ID"
+  _grn "   - 服务器IP : $HOST_IP"
+}
+
+setup_dirs() {
+  _grn ">>> [4/9] 创建目录..."
+  mkdir -p "$WORK_DIR/templates"
+  mkdir -p /var/log
+  touch "$SBOX_LOG" "$LOG_FILE"
+}
+
+gen_panel_creds() {
+  _grn ">>> [5/9] 生成面板账号密码..."
+  CREDS_FILE="$WORK_DIR/credentials.txt"
+  if [[ -f "$CREDS_FILE" ]]; then
+    _ylw "检测到已有面板账号密码：$CREDS_FILE（将复用）"
+    PANEL_USER="$(awk -F': ' '/Username/ {print $2}' "$CREDS_FILE" || true)"
+    PANEL_PASS="$(awk -F': ' '/Password/ {print $2}' "$CREDS_FILE" || true)"
+    [[ -n "$PANEL_USER" && -n "$PANEL_PASS" ]] || {
+      PANEL_USER="admin"
+      PANEL_PASS="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
+      cat > "$CREDS_FILE" <<EOF
+Username: $PANEL_USER
+Password: $PANEL_PASS
+EOF
+      chmod 600 "$CREDS_FILE"
+    }
+  else
+    PANEL_USER="admin"
+    PANEL_PASS="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
+    cat > "$CREDS_FILE" <<EOF
+Username: $PANEL_USER
+Password: $PANEL_PASS
+EOF
+    chmod 600 "$CREDS_FILE"
+  fi
+}
+
+write_app_py() {
+  _grn ">>> [6/9] 写入 Flask 面板（带登录）..."
+  cat > "$WORK_DIR/app.py" <<EOF
 import json
 import os
 import subprocess
 import uuid
-from flask import Flask, render_template, request, redirect
+from datetime import datetime
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+from flask import Flask, render_template, request, redirect, Response
 
 app = Flask(__name__)
-WORK_DIR = "/root/sbox-relay"
-DATA_FILE = f"{WORK_DIR}/data.json"
-SBOX_CONFIG = "/etc/sing-box/config.json"
 
-# 注入的密钥和IP
+WORK_DIR = "${WORK_DIR}"
+DATA_FILE = f"{WORK_DIR}/data.json"
+SBOX_CONFIG = "${SBOX_CONFIG}"
+
 PRIVATE_KEY = "${PRIVATE_KEY}"
 PUBLIC_KEY = "${PUBLIC_KEY}"
 SHORT_ID = "${SHORT_ID}"
-HOST_IP = "${HOST_IP}"
+DEFAULT_IP = "${HOST_IP}"
+
+PANEL_USER = "${PANEL_USER}"
+PANEL_PASS = "${PANEL_PASS}"
+
+def check_auth(username, password):
+    return username == PANEL_USER and password == PANEL_PASS
+
+def authenticate():
+    return Response(
+        "Auth required", 401,
+        {"WWW-Authenticate": 'Basic realm="Sbox Panel"'}
+    )
+
+def requires_auth(f):
+    def wrapped(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    wrapped.__name__ = f.__name__
+    return wrapped
+
+def empty_data():
+    return {"rules": [], "subscriptions": []}
 
 def load_data():
-    if not os.path.exists(DATA_FILE): return []
+    if not os.path.exists(DATA_FILE):
+        return empty_data()
     try:
-        with open(DATA_FILE, 'r') as f: return json.load(f)
-    except: return []
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+    except:
+        return empty_data()
+
+    # 兼容旧格式 list
+    if isinstance(data, list):
+        return {"rules": data, "subscriptions": []}
+
+    data.setdefault("rules", [])
+    data.setdefault("subscriptions", [])
+    return data
 
 def save_data(data):
-    with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2)
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def parse_subscription(text: str):
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("socks5://") or line.startswith("socks://"):
+            parsed = urlparse(line)
+            if not parsed.hostname or not parsed.port:
+                continue
+            items.append({
+                "s_ip": parsed.hostname,
+                "s_port": int(parsed.port),
+                "s_user": parsed.username or "",
+                "s_pass": parsed.password or ""
+            })
+            continue
+
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        items.append({
+            "s_ip": parts[0],
+            "s_port": int(parts[1]),
+            "s_user": parts[2] if len(parts) > 2 else "",
+            "s_pass": parts[3] if len(parts) > 3 else ""
+        })
+    return items
+
+def fetch_subscription(url: str):
+    with urlopen(url, timeout=12) as resp:
+        content = resp.read().decode("utf-8", errors="ignore")
+    return parse_subscription(content)
+
+def sync_subscription(sub, data):
+    parsed = fetch_subscription(sub["url"])
+    base_port = int(sub["base_port"])
+    source_tag = f"sub:{sub['id']}"
+
+    # 清掉旧订阅导入的 rules
+    data["rules"] = [r for r in data["rules"] if r.get("source") != source_tag]
+
+    for index, item in enumerate(parsed):
+        data["rules"].append({
+            "id": str(uuid.uuid4())[:8],
+            "remark": f"{sub['remark']}-{index + 1}",
+            "port": base_port + index,
+            "uuid": str(uuid.uuid4()),
+            "s_ip": item["s_ip"],
+            "s_port": item["s_port"],
+            "s_user": item.get("s_user", ""),
+            "s_pass": item.get("s_pass", ""),
+            "source": source_tag
+        })
+    sub["last_sync"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    sub["count"] = len(parsed)
 
 def generate_sbox_config(rules):
-    # 基础配置模板
     config = {
-        "log": {"level": "info", "output": "/var/log/sing-box.log"},
+        "log": {"level": "info", "output": "${SBOX_LOG}"},
         "inbounds": [],
         "outbounds": [
             {"type": "direct", "tag": "direct"},
@@ -68,17 +249,17 @@ def generate_sbox_config(rules):
         "route": {"rules": [], "final": "direct"}
     }
 
+    # 为每条 rule 创建 inbound/outbound/route 绑定
     for rule in rules:
         in_tag = f"in_{rule['port']}"
         out_tag = f"out_{rule['port']}"
 
-        # 1. VLESS Reality 入站
-        config['inbounds'].append({
+        config["inbounds"].append({
             "type": "vless",
             "tag": in_tag,
             "listen": "::",
-            "listen_port": int(rule['port']),
-            "users": [{"uuid": rule['uuid'], "flow": "xtls-rprx-vision"}],
+            "listen_port": int(rule["port"]),
+            "users": [{"uuid": rule["uuid"], "flow": "xtls-rprx-vision"}],
             "tls": {
                 "enabled": True,
                 "server_name": "www.microsoft.com",
@@ -91,223 +272,346 @@ def generate_sbox_config(rules):
             }
         })
 
-        # 2. Socks5 出站
-        config['outbounds'].insert(0, {
+        config["outbounds"].insert(0, {
             "type": "socks",
             "tag": out_tag,
-            "server": rule['s_ip'],
-            "server_port": int(rule['s_port']),
-            "username": rule['s_user'],
-            "password": rule['s_pass']
+            "server": rule["s_ip"],
+            "server_port": int(rule["s_port"]),
+            "username": rule.get("s_user", ""),
+            "password": rule.get("s_pass", "")
         })
 
-        # 3. 路由绑定
-        config['route']['rules'].insert(0, {
+        config["route"]["rules"].insert(0, {
             "inbound": [in_tag],
             "outbound": out_tag
         })
 
-    # 写入配置并重载
-    with open(SBOX_CONFIG, 'w') as f:
+    os.makedirs(os.path.dirname(SBOX_CONFIG), exist_ok=True)
+    with open(SBOX_CONFIG, "w") as f:
         json.dump(config, f, indent=2)
-    os.system("systemctl reload sing-box")
 
-@app.route('/')
-def index():
-    rules = load_data()
+    os.system("systemctl reload sing-box || systemctl restart sing-box")
+
+def current_ip():
     try:
-        current_ip = subprocess.check_output("curl -s ifconfig.me", shell=True).decode().strip()
+        return subprocess.check_output("curl -fsS ifconfig.me", shell=True).decode().strip()
     except:
-        current_ip = HOST_IP
-        
+        return DEFAULT_IP
+
+@app.route("/")
+@requires_auth
+def index():
+    data = load_data()
+    rules = data["rules"]
+    ip = current_ip()
+
     for r in rules:
-        r['link'] = f"vless://{r['uuid']}@{current_ip}:{r['port']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk={PUBLIC_KEY}&sid={SHORT_ID}#{r['remark']}"
-    return render_template('index.html', rules=rules)
+        r["link"] = (
+            f"vless://{r['uuid']}@{ip}:{r['port']}"
+            f"?encryption=none&flow=xtls-rprx-vision"
+            f"&security=reality&sni=www.microsoft.com&fp=chrome"
+            f"&pbk={PUBLIC_KEY}&sid={SHORT_ID}"
+            f"#{r['remark']}"
+        )
+    return render_template("index.html", rules=rules, subscriptions=data["subscriptions"])
 
-@app.route('/add', methods=['POST'])
+@app.route("/add", methods=["POST"])
+@requires_auth
 def add():
-    rules = load_data()
-    try:
-        new_rule = {
-            "id": str(uuid.uuid4())[:8],
-            "remark": request.form.get('remark'),
-            "port": int(request.form.get('port')),
-            "uuid": str(uuid.uuid4()),
-            "s_ip": request.form.get('s_ip'),
-            "s_port": int(request.form.get('s_port')),
-            "s_user": request.form.get('s_user', ''),
-            "s_pass": request.form.get('s_pass', '')
-        }
-        rules.append(new_rule)
-        save_data(rules)
-        generate_sbox_config(rules)
-    except Exception as e: return f"Error: {str(e)}", 400
-    return redirect('/')
+    data = load_data()
+    new_rule = {
+        "id": str(uuid.uuid4())[:8],
+        "remark": request.form.get("remark", "").strip(),
+        "port": int(request.form.get("port")),
+        "uuid": str(uuid.uuid4()),
+        "s_ip": request.form.get("s_ip", "").strip(),
+        "s_port": int(request.form.get("s_port")),
+        "s_user": request.form.get("s_user", "").strip(),
+        "s_pass": request.form.get("s_pass", "").strip(),
+        "source": "manual"
+    }
+    if not new_rule["remark"] or not new_rule["s_ip"]:
+        return "Bad request", 400
 
-@app.route('/del/<id>')
-def delete(id):
-    rules = load_data()
-    rules = [r for r in rules if r['id'] != id]
-    save_data(rules)
-    generate_sbox_config(rules)
-    return redirect('/')
+    # 端口冲突检查
+    if any(r["port"] == new_rule["port"] for r in data["rules"]):
+        return "Port already exists", 400
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    data["rules"].append(new_rule)
+    save_data(data)
+    generate_sbox_config(data["rules"])
+    return redirect("/")
+
+@app.route("/del/<rid>")
+@requires_auth
+def delete(rid):
+    data = load_data()
+    data["rules"] = [r for r in data["rules"] if r["id"] != rid]
+    save_data(data)
+    generate_sbox_config(data["rules"])
+    return redirect("/")
+
+@app.route("/add-sub", methods=["POST"])
+@requires_auth
+def add_sub():
+    data = load_data()
+    sub = {
+        "id": str(uuid.uuid4())[:8],
+        "remark": request.form.get("sub_remark", "").strip(),
+        "url": request.form.get("sub_url", "").strip(),
+        "base_port": int(request.form.get("sub_base_port")),
+        "last_sync": "",
+        "count": 0
+    }
+    if not sub["remark"] or not sub["url"]:
+        return "Bad request", 400
+
+    data["subscriptions"].append(sub)
+    sync_subscription(sub, data)
+    save_data(data)
+    generate_sbox_config(data["rules"])
+    return redirect("/")
+
+@app.route("/sync/<sid>")
+@requires_auth
+def sync(sid):
+    data = load_data()
+    sub = next((s for s in data["subscriptions"] if s["id"] == sid), None)
+    if not sub:
+        return "Not found", 404
+    sync_subscription(sub, data)
+    save_data(data)
+    generate_sbox_config(data["rules"])
+    return redirect("/")
+
+@app.route("/del-sub/<sid>")
+@requires_auth
+def del_sub(sid):
+    data = load_data()
+    data["subscriptions"] = [s for s in data["subscriptions"] if s["id"] != sid]
+    data["rules"] = [r for r in data["rules"] if r.get("source") != f"sub:{sid}"]
+    save_data(data)
+    generate_sbox_config(data["rules"])
+    return redirect("/")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=${PANEL_PORT})
 EOF
+}
 
-echo ">>> [6/8] 写入前端页面..."
-cat > "$WORK_DIR/templates/index.html" <<HTML_EOF
+write_index_html() {
+  _grn ">>> [7/9] 写入前端页面..."
+  cat > "$WORK_DIR/templates/index.html" <<'HTML'
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Socks5 Relay Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>body{background:#f4f6f9;font-family:sans-serif;}.card{border:none;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,0.05);}</style>
+  <title>Socks5 Relay Panel</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{background:#f4f6f9;font-family:sans-serif;}
+    .card{border:none;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,0.05);}
+  </style>
 </head>
 <body>
 <div class="container py-5">
-    <div class="card">
-        <div class="card-header bg-primary text-white text-center py-3">
-            <h4 class="mb-0">🚀 Socks5 加速中转面板</h4>
-        </div>
-        <div class="card-body p-4">
-            <form action="/add" method="POST" class="row g-3 mb-4 pb-4 border-bottom">
-                <div class="col-md-3">
-                    <label class="form-label text-muted small">备注名</label>
-                    <input type="text" name="remark" class="form-control" placeholder="例如: 店铺A" required>
-                </div>
-                <div class="col-md-2">
-                    <label class="form-label text-muted small">中转端口 (入口)</label>
-                    <input type="number" name="port" class="form-control" placeholder="20001" required>
-                </div>
-                <div class="col-md-3">
-                    <label class="form-label text-muted small">Socks5 IP (目标)</label>
-                    <input type="text" name="s_ip" class="form-control" placeholder="1.2.3.4" required>
-                </div>
-                <div class="col-md-2">
-                    <label class="form-label text-muted small">Socks5 端口</label>
-                    <input type="number" name="s_port" class="form-control" placeholder="1080" required>
-                </div>
-                <div class="col-md-2">
-                    <label class="form-label text-muted small">Socks5 账号/密码</label>
-                    <div class="input-group">
-                        <input type="text" name="s_user" class="form-control" placeholder="User">
-                        <input type="text" name="s_pass" class="form-control" placeholder="Pass">
-                    </div>
-                </div>
-                <div class="col-12 mt-4">
-                    <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">➕ 添加并生成加速链接</button>
-                </div>
-            </form>
-
-            <div class="table-responsive">
-                <table class="table table-hover align-middle">
-                    <thead class="table-light">
-                        <tr>
-                            <th>备注</th>
-                            <th>中转端口</th>
-                            <th>目标 IP</th>
-                            <th style="width: 40%;">VLESS 链接 (点击复制)</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for r in rules %}
-                        <tr>
-                            <td><span class="badge bg-secondary">{{ r.remark }}</span></td>
-                            <td class="fw-bold text-success">:{{ r.port }}</td>
-                            <td class="text-muted small">{{ r.s_ip }}:{{ r.s_port }}</td>
-                            <td>
-                                <input type="text" class="form-control form-control-sm bg-white" value="{{ r.link }}" 
-                                       onclick="this.select();document.execCommand('copy');this.classList.add('is-valid');" readonly>
-                            </td>
-                            <td><a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删除</a></td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        <div class="card-footer text-center text-muted small bg-white py-3">
-            已自动生成 Reality 密钥并配置防火墙 | 面板端口: 5000
-        </div>
+  <div class="card">
+    <div class="card-header bg-primary text-white text-center py-3">
+      <h4 class="mb-0">🚀 Socks5 加速中转面板（VLESS Reality）</h4>
     </div>
+
+    <div class="card-body p-4">
+      <form action="/add" method="POST" class="row g-3 mb-4 pb-4 border-bottom">
+        <div class="col-md-3">
+          <label class="form-label text-muted small">备注名</label>
+          <input type="text" name="remark" class="form-control" placeholder="例如: 店铺A" required>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label text-muted small">中转端口(入口)</label>
+          <input type="number" name="port" class="form-control" placeholder="20001" required>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label text-muted small">Socks5 IP(目标)</label>
+          <input type="text" name="s_ip" class="form-control" placeholder="1.2.3.4" required>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label text-muted small">Socks5 端口</label>
+          <input type="number" name="s_port" class="form-control" placeholder="1080" required>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label text-muted small">Socks5 账号/密码</label>
+          <div class="input-group">
+            <input type="text" name="s_user" class="form-control" placeholder="User">
+            <input type="text" name="s_pass" class="form-control" placeholder="Pass">
+          </div>
+        </div>
+        <div class="col-12 mt-4">
+          <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">➕ 添加并生成加速链接</button>
+        </div>
+      </form>
+
+      <form action="/add-sub" method="POST" class="row g-3 mb-4 pb-4 border-bottom">
+        <div class="col-md-3">
+          <label class="form-label text-muted small">订阅名称</label>
+          <input type="text" name="sub_remark" class="form-control" placeholder="例如: 住宅订阅A" required>
+        </div>
+        <div class="col-md-5">
+          <label class="form-label text-muted small">订阅链接</label>
+          <input type="url" name="sub_url" class="form-control" placeholder="https://example.com/sub.txt" required>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label text-muted small">起始端口</label>
+          <input type="number" name="sub_base_port" class="form-control" placeholder="21000" required>
+        </div>
+        <div class="col-md-2 d-flex align-items-end">
+          <button type="submit" class="btn btn-outline-primary w-100 fw-bold">🔄 导入订阅</button>
+        </div>
+        <div class="col-12">
+          <div class="small text-muted">
+            订阅格式支持：<code>socks5://user:pass@ip:port</code> 或 <code>ip:port:user:pass</code>（一行一个）
+          </div>
+        </div>
+      </form>
+
+      {% if subscriptions %}
+      <div class="table-responsive mb-4">
+        <table class="table table-sm table-bordered align-middle">
+          <thead class="table-light">
+            <tr>
+              <th>订阅</th>
+              <th>起始端口</th>
+              <th>数量</th>
+              <th>最后同步</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in subscriptions %}
+            <tr>
+              <td class="fw-bold">{{ s.remark }}</td>
+              <td>{{ s.base_port }}</td>
+              <td>{{ s.count }}</td>
+              <td class="text-muted small">{{ s.last_sync or '未同步' }}</td>
+              <td>
+                <a href="/sync/{{ s.id }}" class="btn btn-outline-secondary btn-sm">同步</a>
+                <a href="/del-sub/{{ s.id }}" class="btn btn-outline-danger btn-sm">删除</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      <div class="table-responsive">
+        <table class="table table-hover align-middle">
+          <thead class="table-light">
+            <tr>
+              <th>备注</th>
+              <th>中转端口</th>
+              <th>目标 IP</th>
+              <th style="width:40%;">VLESS 链接（点击复制）</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rules %}
+            <tr>
+              <td><span class="badge bg-secondary">{{ r.remark }}</span></td>
+              <td class="fw-bold text-success">:{{ r.port }}</td>
+              <td class="text-muted small">{{ r.s_ip }}:{{ r.s_port }}</td>
+              <td>
+                <input type="text" class="form-control form-control-sm bg-white"
+                       value="{{ r.link }}"
+                       onclick="this.select();document.execCommand('copy');this.classList.add('is-valid');"
+                       readonly>
+              </td>
+              <td><a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删除</a></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+    </div>
+
+    <div class="card-footer text-center text-muted small bg-white py-3">
+      面板端口：5000（已启用 Basic Auth 登录）| Sing-box 日志：/var/log/sing-box.log
+    </div>
+  </div>
 </div>
 </body>
 </html>
-HTML_EOF
+HTML
+}
 
-echo ">>> [7/8] 配置系统服务..."
+write_systemd() {
+  _grn ">>> [8/9] 写入 systemd 服务..."
 
-# 1. 创建面板服务
-cat > /etc/systemd/system/sbox-web.service <<EOF
+  # sbox-panel: gunicorn 托管 flask
+  cat > /etc/systemd/system/sbox-panel.service <<EOF
 [Unit]
-Description=Singbox Web Panel
+Description=Sbox Relay Panel (Flask/Gunicorn)
 After=network.target
 
 [Service]
-User=root
-WorkingDirectory=/root/sbox-relay
-ExecStart=/usr/bin/python3 app.py
+Type=simple
+WorkingDirectory=${WORK_DIR}
+ExecStart=/usr/bin/gunicorn -w 2 -b 0.0.0.0:${PANEL_PORT} app:app
 Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 2. 修改 Sing-box 权限 (解决 Trixie 上的日志与内核权限报错)
-sed -i 's/User=sing-box/User=root/g' /lib/systemd/system/sing-box.service
-sed -i 's/Group=sing-box/Group=root/g' /lib/systemd/system/sing-box.service
+  systemctl daemon-reload
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  systemctl enable sbox-panel >/dev/null 2>&1
 
-# 3. 初始化日志文件
-touch /var/log/sing-box.log
-chmod 777 /var/log/sing-box.log
-
-# 4. 重载服务引擎
-systemctl daemon-reload
-
-echo ">>> [8/8] 正在开放端口并启动..."
-
-# 1. 开放防火墙端口 (面板 5000 + 默认常用的中转端口范围)
-if command -v ufw >/dev/null; then
-    ufw allow 5000/tcp
-    ufw allow 20000:30000/tcp
-    ufw allow 20000:30000/udp
-fi
-
-# 2. 启动服务并设置自启
-systemctl enable sbox-web sing-box
-systemctl restart sbox-web sing-box
-
-echo "------------------------------------------------"
-echo "✅ 全部部署完成！"
-echo "🌐 管理面板地址: http://${HOST_IP}:5000"
-echo "🔑 初始 Reality 公钥: ${PUBLIC_KEY}"
-echo "------------------------------------------------"
-
-# 1. 创建目录
-mkdir -p /etc/sing-box
-
-# 2. 写入最简基础配置
-cat > /etc/sing-box/config.json <<EOF
-{
-  "log": {
-    "level": "info"
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": []
-  }
+  systemctl restart sing-box || true
+  systemctl restart sbox-panel
 }
-EOF
 
-# 3. 再次尝试启动
-systemctl restart sing-box
+final_print() {
+  _grn ">>> [9/9] 完成 ✅"
+  get_public_ip
+
+  echo
+  _grn "================= 面板信息 ================="
+  _grn "面板地址:  http://${HOST_IP}:${PANEL_PORT}/"
+  _grn "账号:      ${PANEL_USER}"
+  _grn "密码:      ${PANEL_PASS}"
+  _grn "凭据文件:  ${WORK_DIR}/credentials.txt"
+  echo
+  _grn "================ Reality 信息 ==============="
+  _grn "PublicKey: ${PUBLIC_KEY}"
+  _grn "ShortID:   ${SHORT_ID}"
+  echo
+  _grn "================ 服务状态 ==================="
+  systemctl is-active --quiet sing-box && _grn "sing-box:   active" || _ylw "sing-box:   not active"
+  systemctl is-active --quiet sbox-panel && _grn "sbox-panel: active" || _ylw "sbox-panel: not active"
+  echo
+  _ylw "日志："
+  _ylw "  sing-box:   ${SBOX_LOG}"
+  _ylw "  sbox-panel: ${LOG_FILE}"
+  echo
+}
+
+main() {
+  require_root
+  detect_os
+  install_deps
+  install_singbox
+  setup_dirs
+  gen_reality_keys
+  gen_panel_creds
+  write_app_py
+  write_index_html
+  write_systemd
+  final_print
+}
+
+main "$@"
