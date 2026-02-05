@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail
 
 ### ========= 基本配置（可改） =========
 WORK_DIR="/root/sbox-relay"
@@ -615,3 +616,4 @@ main() {
 }
 
 main "$@"
+
