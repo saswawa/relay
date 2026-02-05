@@ -1,128 +1,111 @@
 #!/bin/sh
 set -e
 
-
-### ========= 基本配置（可改） =========
+# ========= 基本配置 =========
 WORK_DIR="/root/sbox-relay"
 PANEL_PORT="5000"
 SBOX_CONFIG="/etc/sing-box/config.json"
-LOG_FILE="/var/log/sbox-panel.log"
 SBOX_LOG="/var/log/sing-box.log"
-### ===================================
+PANEL_LOG="/var/log/sbox-panel.log"
+CREDS_FILE="$WORK_DIR/credentials.txt"
+VENV_DIR="$WORK_DIR/venv"
 
-_red(){ echo -e "\033[31m$*\033[0m"; }
-_grn(){ echo -e "\033[32m$*\033[0m"; }
-_ylw(){ echo -e "\033[33m$*\033[0m"; }
+# ========= 小工具 =========
+say() { printf '%s\n' "$*"; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
 
-require_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    _red "请用 root 运行：sudo -i 后再执行"
-    exit 1
-  fi
+need_root() {
+  [ "$(id -u)" = "0" ] || die "请用 root 运行：sudo -i 后再执行"
 }
 
-detect_os() {
-  if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+fetch() {
+  # 用法：fetch URL
+  if have curl; then
+    curl -fsSL "$1"
+  elif have wget; then
+    wget -qO- "$1"
   else
-    OS_ID="unknown"
+    die "缺少 curl/wget，请先安装：apt-get update && apt-get install -y curl"
   fi
-  case "$OS_ID" in
-    ubuntu|debian) ;;
-    *)
-      _ylw "未识别系统为 Debian/Ubuntu（检测到: $OS_ID），仍尝试继续安装。"
-      ;;
-  esac
 }
 
-install_deps() {
-  _grn ">>> [1/9] 更新系统并安装依赖..."
-  apt-get update -q
-  apt-get install -y --no-install-recommends \
-    python3 python3-pip \
-    curl wget ca-certificates \
-    openssl \
-    socat \
-    jq
-  pip3 install --upgrade pip >/dev/null
-  pip3 install flask gunicorn >/dev/null
+get_ip() {
+  IP="$(fetch https://ifconfig.me 2>/dev/null || true)"
+  [ -n "$IP" ] || IP="$(fetch https://api.ipify.org 2>/dev/null || true)"
+  [ -n "$IP" ] || IP="127.0.0.1"
+  echo "$IP"
 }
 
-install_singbox() {
-  _grn ">>> [2/9] 安装 Sing-box..."
-  if command -v sing-box >/dev/null 2>&1; then
-    _ylw "Sing-box 已存在，跳过安装。"
-    return
+rand_pass() {
+  if have openssl; then
+    openssl rand -base64 18 | tr -d '=+/ \n' | cut -c1-16
+  else
+    # 兜底：时间戳+pid（够用）
+    echo "$(date +%s)$$" | tr -d '\n' | cut -c1-16
   fi
-  bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 }
 
-get_public_ip() {
-  # 多源兜底
-  HOST_IP="$(curl -fsS ifconfig.me 2>/dev/null || true)"
-  [[ -n "${HOST_IP}" ]] || HOST_IP="$(curl -fsS api.ipify.org 2>/dev/null || true)"
-  [[ -n "${HOST_IP}" ]] || HOST_IP="127.0.0.1"
-}
+# ========= 开始 =========
+need_root
+umask 077
 
-gen_reality_keys() {
-  _grn ">>> [3/9] 生成 Reality 密钥..."
-  KEYS="$(sing-box generate reality-keypair)"
-  PRIVATE_KEY="$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')"
-  PUBLIC_KEY="$(echo "$KEYS"  | awk '/PublicKey/  {print $2}')"
-  SHORT_ID="$(openssl rand -hex 4)"
-  get_public_ip
+say ">>> [1/8] 安装系统依赖..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y --no-install-recommends \
+  ca-certificates curl wget \
+  python3 python3-venv \
+  openssl jq socat
 
-  _grn "   - 公钥(PBK): $PUBLIC_KEY"
-  _grn "   - ShortID  : $SHORT_ID"
-  _grn "   - 服务器IP : $HOST_IP"
-}
+mkdir -p "$WORK_DIR/templates"
+mkdir -p /var/log
+touch "$SBOX_LOG" "$PANEL_LOG"
 
-setup_dirs() {
-  _grn ">>> [4/9] 创建目录..."
-  mkdir -p "$WORK_DIR/templates"
-  mkdir -p /var/log
-  touch "$SBOX_LOG" "$LOG_FILE"
-}
+say ">>> [2/8] 安装 Sing-box（如已安装会跳过）..."
+if ! have sing-box; then
+  fetch https://sing-box.app/deb-install.sh | sh
+fi
+have sing-box || die "sing-box 安装失败"
 
-gen_panel_creds() {
-  _grn ">>> [5/9] 生成面板账号密码..."
-  CREDS_FILE="$WORK_DIR/credentials.txt"
-  if [[ -f "$CREDS_FILE" ]]; then
-    _ylw "检测到已有面板账号密码：$CREDS_FILE（将复用）"
-    PANEL_USER="$(awk -F': ' '/Username/ {print $2}' "$CREDS_FILE" || true)"
-    PANEL_PASS="$(awk -F': ' '/Password/ {print $2}' "$CREDS_FILE" || true)"
-    [[ -n "$PANEL_USER" && -n "$PANEL_PASS" ]] || {
-      PANEL_USER="admin"
-      PANEL_PASS="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
-      cat > "$CREDS_FILE" <<EOF
+say ">>> [3/8] 创建 Python venv（解决 Debian PEP668 pip 限制）..."
+if [ ! -d "$VENV_DIR" ]; then
+  python3 -m venv "$VENV_DIR"
+fi
+# 在 venv 内安装依赖
+"$VENV_DIR/bin/pip" install -U pip >/dev/null 2>&1 || true
+"$VENV_DIR/bin/pip" install flask gunicorn >/dev/null 2>&1
+
+say ">>> [4/8] 生成/复用面板账号密码..."
+if [ -f "$CREDS_FILE" ]; then
+  PANEL_USER="$(sed -n 's/^Username: //p' "$CREDS_FILE" | head -n 1)"
+  PANEL_PASS="$(sed -n 's/^Password: //p' "$CREDS_FILE" | head -n 1)"
+fi
+[ -n "${PANEL_USER:-}" ] || PANEL_USER="admin"
+[ -n "${PANEL_PASS:-}" ] || PANEL_PASS="$(rand_pass)"
+cat > "$CREDS_FILE" <<EOF
 Username: $PANEL_USER
 Password: $PANEL_PASS
 EOF
-      chmod 600 "$CREDS_FILE"
-    }
-  else
-    PANEL_USER="admin"
-    PANEL_PASS="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
-    cat > "$CREDS_FILE" <<EOF
-Username: $PANEL_USER
-Password: $PANEL_PASS
-EOF
-    chmod 600 "$CREDS_FILE"
-  fi
-}
+chmod 600 "$CREDS_FILE"
 
-write_app_py() {
-  _grn ">>> [6/9] 写入 Flask 面板（带登录）..."
-  cat > "$WORK_DIR/app.py" <<EOF
-import json
-import os
-import subprocess
-import uuid
+say ">>> [5/8] 生成 Reality 密钥（每次运行会重新生成）..."
+KEYS="$(sing-box generate reality-keypair)"
+PRIVATE_KEY="$(echo "$KEYS" | awk '/PrivateKey/ {print $2}')"
+PUBLIC_KEY="$(echo "$KEYS" | awk '/PublicKey/ {print $2}')"
+SHORT_ID="$(openssl rand -hex 4)"
+HOST_IP="$(get_ip)"
+
+[ -n "$PRIVATE_KEY" ] || die "Reality 私钥生成失败"
+[ -n "$PUBLIC_KEY" ]  || die "Reality 公钥生成失败"
+
+say ">>> [6/8] 写入面板后端 app.py..."
+cat > "$WORK_DIR/app.py" <<EOF
+import json, os, subprocess, uuid
 from datetime import datetime
 from urllib.parse import urlparse
 from urllib.request import urlopen
-
 from flask import Flask, render_template, request, redirect, Response
 
 app = Flask(__name__)
@@ -130,30 +113,27 @@ app = Flask(__name__)
 WORK_DIR = "${WORK_DIR}"
 DATA_FILE = f"{WORK_DIR}/data.json"
 SBOX_CONFIG = "${SBOX_CONFIG}"
+SBOX_LOG = "${SBOX_LOG}"
 
 PRIVATE_KEY = "${PRIVATE_KEY}"
-PUBLIC_KEY = "${PUBLIC_KEY}"
-SHORT_ID = "${SHORT_ID}"
-DEFAULT_IP = "${HOST_IP}"
+PUBLIC_KEY  = "${PUBLIC_KEY}"
+SHORT_ID    = "${SHORT_ID}"
+DEFAULT_IP  = "${HOST_IP}"
 
 PANEL_USER = "${PANEL_USER}"
 PANEL_PASS = "${PANEL_PASS}"
 
-def check_auth(username, password):
-    return username == PANEL_USER and password == PANEL_PASS
+def check_auth(u, p): return u == PANEL_USER and p == PANEL_PASS
 
 def authenticate():
-    return Response(
-        "Auth required", 401,
-        {"WWW-Authenticate": 'Basic realm="Sbox Panel"'}
-    )
+    return Response("Auth required", 401, {"WWW-Authenticate": 'Basic realm="Sbox Panel"'})
 
 def requires_auth(f):
-    def wrapped(*args, **kwargs):
+    def wrapped(*a, **kw):
         auth = request.authorization
         if not auth or not check_auth(auth.username, auth.password):
             return authenticate()
-        return f(*args, **kwargs)
+        return f(*a, **kw)
     wrapped.__name__ = f.__name__
     return wrapped
 
@@ -168,11 +148,8 @@ def load_data():
             data = json.load(f)
     except:
         return empty_data()
-
-    # 兼容旧格式 list
-    if isinstance(data, list):
+    if isinstance(data, list):  # 兼容旧格式
         return {"rules": data, "subscriptions": []}
-
     data.setdefault("rules", [])
     data.setdefault("subscriptions", [])
     return data
@@ -187,28 +164,16 @@ def parse_subscription(text: str):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-
         if line.startswith("socks5://") or line.startswith("socks://"):
-            parsed = urlparse(line)
-            if not parsed.hostname or not parsed.port:
+            p = urlparse(line)
+            if not p.hostname or not p.port:
                 continue
-            items.append({
-                "s_ip": parsed.hostname,
-                "s_port": int(parsed.port),
-                "s_user": parsed.username or "",
-                "s_pass": parsed.password or ""
-            })
+            items.append({"s_ip": p.hostname, "s_port": int(p.port), "s_user": p.username or "", "s_pass": p.password or ""})
             continue
-
         parts = line.split(":")
         if len(parts) < 2:
             continue
-        items.append({
-            "s_ip": parts[0],
-            "s_port": int(parts[1]),
-            "s_user": parts[2] if len(parts) > 2 else "",
-            "s_pass": parts[3] if len(parts) > 3 else ""
-        })
+        items.append({"s_ip": parts[0], "s_port": int(parts[1]), "s_user": parts[2] if len(parts) > 2 else "", "s_pass": parts[3] if len(parts) > 3 else ""})
     return items
 
 def fetch_subscription(url: str):
@@ -220,20 +185,17 @@ def sync_subscription(sub, data):
     parsed = fetch_subscription(sub["url"])
     base_port = int(sub["base_port"])
     source_tag = f"sub:{sub['id']}"
-
-    # 清掉旧订阅导入的 rules
     data["rules"] = [r for r in data["rules"] if r.get("source") != source_tag]
-
-    for index, item in enumerate(parsed):
+    for i, item in enumerate(parsed):
         data["rules"].append({
             "id": str(uuid.uuid4())[:8],
-            "remark": f"{sub['remark']}-{index + 1}",
-            "port": base_port + index,
+            "remark": f"{sub['remark']}-{i+1}",
+            "port": base_port + i,
             "uuid": str(uuid.uuid4()),
             "s_ip": item["s_ip"],
             "s_port": item["s_port"],
-            "s_user": item.get("s_user", ""),
-            "s_pass": item.get("s_pass", ""),
+            "s_user": item.get("s_user",""),
+            "s_pass": item.get("s_pass",""),
             "source": source_tag
         })
     sub["last_sync"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -241,16 +203,15 @@ def sync_subscription(sub, data):
 
 def generate_sbox_config(rules):
     config = {
-        "log": {"level": "info", "output": "${SBOX_LOG}"},
+        "log": {"level": "info", "output": SBOX_LOG},
         "inbounds": [],
         "outbounds": [
             {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"}
+            {"type": "block", "tag": "block"},
         ],
         "route": {"rules": [], "final": "direct"}
     }
 
-    # 为每条 rule 创建 inbound/outbound/route 绑定
     for rule in rules:
         in_tag = f"in_{rule['port']}"
         out_tag = f"out_{rule['port']}"
@@ -268,7 +229,7 @@ def generate_sbox_config(rules):
                     "enabled": True,
                     "handshake": {"server": "www.microsoft.com", "server_port": 443},
                     "private_key": PRIVATE_KEY,
-                    "short_id": [SHORT_ID]
+                    "short_id": [SHORT_ID],
                 }
             }
         })
@@ -278,14 +239,11 @@ def generate_sbox_config(rules):
             "tag": out_tag,
             "server": rule["s_ip"],
             "server_port": int(rule["s_port"]),
-            "username": rule.get("s_user", ""),
-            "password": rule.get("s_pass", "")
+            "username": rule.get("s_user",""),
+            "password": rule.get("s_pass",""),
         })
 
-        config["route"]["rules"].insert(0, {
-            "inbound": [in_tag],
-            "outbound": out_tag
-        })
+        config["route"]["rules"].insert(0, {"inbound": [in_tag], "outbound": out_tag})
 
     os.makedirs(os.path.dirname(SBOX_CONFIG), exist_ok=True)
     with open(SBOX_CONFIG, "w") as f:
@@ -305,7 +263,6 @@ def index():
     data = load_data()
     rules = data["rules"]
     ip = current_ip()
-
     for r in rules:
         r["link"] = (
             f"vless://{r['uuid']}@{ip}:{r['port']}"
@@ -322,22 +279,19 @@ def add():
     data = load_data()
     new_rule = {
         "id": str(uuid.uuid4())[:8],
-        "remark": request.form.get("remark", "").strip(),
+        "remark": (request.form.get("remark") or "").strip(),
         "port": int(request.form.get("port")),
         "uuid": str(uuid.uuid4()),
-        "s_ip": request.form.get("s_ip", "").strip(),
+        "s_ip": (request.form.get("s_ip") or "").strip(),
         "s_port": int(request.form.get("s_port")),
-        "s_user": request.form.get("s_user", "").strip(),
-        "s_pass": request.form.get("s_pass", "").strip(),
+        "s_user": (request.form.get("s_user") or "").strip(),
+        "s_pass": (request.form.get("s_pass") or "").strip(),
         "source": "manual"
     }
     if not new_rule["remark"] or not new_rule["s_ip"]:
         return "Bad request", 400
-
-    # 端口冲突检查
     if any(r["port"] == new_rule["port"] for r in data["rules"]):
         return "Port already exists", 400
-
     data["rules"].append(new_rule)
     save_data(data)
     generate_sbox_config(data["rules"])
@@ -358,15 +312,14 @@ def add_sub():
     data = load_data()
     sub = {
         "id": str(uuid.uuid4())[:8],
-        "remark": request.form.get("sub_remark", "").strip(),
-        "url": request.form.get("sub_url", "").strip(),
+        "remark": (request.form.get("sub_remark") or "").strip(),
+        "url": (request.form.get("sub_url") or "").strip(),
         "base_port": int(request.form.get("sub_base_port")),
         "last_sync": "",
         "count": 0
     }
     if not sub["remark"] or not sub["url"]:
         return "Bad request", 400
-
     data["subscriptions"].append(sub)
     sync_subscription(sub, data)
     save_data(data)
@@ -394,15 +347,10 @@ def del_sub(sid):
     save_data(data)
     generate_sbox_config(data["rules"])
     return redirect("/")
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=${PANEL_PORT})
 EOF
-}
 
-write_index_html() {
-  _grn ">>> [7/9] 写入前端页面..."
-  cat > "$WORK_DIR/templates/index.html" <<'HTML'
+say ">>> [7/8] 写入前端页面 index.html..."
+cat > "$WORK_DIR/templates/index.html" <<'HTML'
 <!DOCTYPE html>
 <html>
 <head>
@@ -537,84 +485,56 @@ write_index_html() {
     </div>
 
     <div class="card-footer text-center text-muted small bg-white py-3">
-      面板端口：5000（已启用 Basic Auth 登录）| Sing-box 日志：/var/log/sing-box.log
+      面板端口：5000（已启用账号密码）| sing-box 日志：/var/log/sing-box.log
     </div>
   </div>
 </div>
 </body>
 </html>
 HTML
-}
 
-write_systemd() {
-  _grn ">>> [8/9] 写入 systemd 服务..."
-
-  # sbox-panel: gunicorn 托管 flask
-  cat > /etc/systemd/system/sbox-panel.service <<EOF
+say ">>> [8/8] 写入 systemd 服务并启动..."
+cat > /etc/systemd/system/sbox-panel.service <<EOF
 [Unit]
-Description=Sbox Relay Panel (Flask/Gunicorn)
+Description=Sbox Relay Panel
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=${WORK_DIR}
-ExecStart=/usr/bin/gunicorn -w 2 -b 0.0.0.0:${PANEL_PORT} app:app
+ExecStart=${VENV_DIR}/bin/gunicorn -w 2 -b 0.0.0.0:${PANEL_PORT} app:app
 Restart=always
 RestartSec=2
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
+StandardOutput=append:${PANEL_LOG}
+StandardError=append:${PANEL_LOG}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
+systemctl daemon-reload
+systemctl enable sbox-panel >/dev/null 2>&1 || true
+systemctl restart sbox-panel
+
+# sing-box 服务一般安装脚本会自带；没有就尽量启动一次
+if systemctl list-unit-files | grep -q '^sing-box\.service'; then
   systemctl enable sing-box >/dev/null 2>&1 || true
-  systemctl enable sbox-panel >/dev/null 2>&1
-
   systemctl restart sing-box || true
-  systemctl restart sbox-panel
-}
+fi
 
-final_print() {
-  _grn ">>> [9/9] 完成 ✅"
-  get_public_ip
-
-  echo
-  _grn "================= 面板信息 ================="
-  _grn "面板地址:  http://${HOST_IP}:${PANEL_PORT}/"
-  _grn "账号:      ${PANEL_USER}"
-  _grn "密码:      ${PANEL_PASS}"
-  _grn "凭据文件:  ${WORK_DIR}/credentials.txt"
-  echo
-  _grn "================ Reality 信息 ==============="
-  _grn "PublicKey: ${PUBLIC_KEY}"
-  _grn "ShortID:   ${SHORT_ID}"
-  echo
-  _grn "================ 服务状态 ==================="
-  systemctl is-active --quiet sing-box && _grn "sing-box:   active" || _ylw "sing-box:   not active"
-  systemctl is-active --quiet sbox-panel && _grn "sbox-panel: active" || _ylw "sbox-panel: not active"
-  echo
-  _ylw "日志："
-  _ylw "  sing-box:   ${SBOX_LOG}"
-  _ylw "  sbox-panel: ${LOG_FILE}"
-  echo
-}
-
-main() {
-  require_root
-  detect_os
-  install_deps
-  install_singbox
-  setup_dirs
-  gen_reality_keys
-  gen_panel_creds
-  write_app_py
-  write_index_html
-  write_systemd
-  final_print
-}
-
-main "$@"
-
-
+# 输出结果（傻瓜直接看这里）
+HOST_IP="$(get_ip)"
+say ""
+say "================= 安装完成 ================="
+say "面板地址:  http://${HOST_IP}:${PANEL_PORT}/"
+say "用户名:    ${PANEL_USER}"
+say "密码:      ${PANEL_PASS}"
+say "凭据文件:  ${CREDS_FILE}"
+say ""
+say "Reality 公钥(PBK): ${PUBLIC_KEY}"
+say "Reality ShortID  : ${SHORT_ID}"
+say ""
+say "查看日志："
+say "  面板:   ${PANEL_LOG}"
+say "  sing-box:${SBOX_LOG}"
+say "==========================================="
