@@ -2,12 +2,12 @@
 set -e
 
 # ==========================================
-# Socks5 转 VLESS 极简中转面板 (2.5 不死安装版)
+# Socks5 转 VLESS 极简中转面板 (v3.3 密钥固化版)
 # 变更日志:
-# 2.5: 增加 Sing-box 安装备选源 (解决 curl TLS 错误)
-# 2.4: 强制 IPv4 + Google DNS
-# 2.3: 端口迁移 30000+
-# 适用系统: Debian 10/11/12/13, Ubuntu 20/22/24
+# 3.3: 修复 10086/10087 端口不启动的问题 (强制刷新配置)
+#      新增 [密钥持久化]：升级脚本不再改变 Reality 密钥，旧链接永久有效
+# 3.2: 本机直连节点
+# 3.1: 修改密码 + 防爆破
 # ==========================================
 
 sed -i 's/\r$//' "$0" 2>/dev/null || true
@@ -21,75 +21,51 @@ LOG_FILE="/var/log/sing-box-install.log"
 
 install_singbox() {
     echo ">>> [2/8] 正在安装 Sing-box..."
-    
-    # 尝试1: 官方脚本
-    echo "   - 尝试方式 1: 官方脚本安装..."
-    if bash <(curl -fsSL https://sing-box.app/deb-install.sh) >/dev/null 2>&1; then
-        echo "   ✅ 官方脚本安装成功!"
-        return 0
-    fi
-    echo "   ⚠️ 方式 1 失败，尝试方式 2..."
-    
-    # 尝试2: GitHub Release 直接下载 (amd64, v1.10.7 稳定版)
+    if bash <(curl -fsSL https://sing-box.app/deb-install.sh) >/dev/null 2>&1; then return 0; fi
     SBOX_VER="v1.10.7"
-    if [ "$(uname -m)" = "x86_64" ]; then
-        ARCH="amd64"
-    elif [ "$(uname -m)" = "aarch64" ]; then
-        ARCH="arm64" 
-    else
-        echo "   ❌ 不支持的架构: $(uname -m)"
-        return 1
-    fi
-    
+    if [ "$(uname -m)" = "x86_64" ]; then ARCH="amd64"; elif [ "$(uname -m)" = "aarch64" ]; then ARCH="arm64"; else return 1; fi
     DEB_URL="https://github.com/SagerNet/sing-box/releases/download/${SBOX_VER}/sing-box_1.10.7_linux_${ARCH}.deb"
-    
-    echo "   - 尝试方式 2: GitHub 直接下载 (${DEB_URL})..."
     rm -f /tmp/sing-box.deb
-    if wget -O /tmp/sing-box.deb "$DEB_URL" >/dev/null 2>&1; then
+    if wget -O /tmp/sing-box.deb "$DEB_URL" >/dev/null 2>&1 || wget -O /tmp/sing-box.deb "https://ghfast.top/${DEB_URL}" >/dev/null 2>&1; then
         dpkg -i /tmp/sing-box.deb >/dev/null 2>&1
-        echo "   ✅ GitHub包安装成功!"
         rm -f /tmp/sing-box.deb
         return 0
     fi
-    echo "   ⚠️ 方式 2 失败 (可能是网络连通性差), 尝试手动代理源..."
-
-    # 尝试3: 使用 ghproxy 极速源
-    PROXY_URL="https://ghfast.top/${DEB_URL}"
-    echo "   - 尝试方式 3: 加速代理源 (${PROXY_URL})..."
-    if wget -O /tmp/sing-box.deb "$PROXY_URL" >/dev/null 2>&1 || curl -L -o /tmp/sing-box.deb "$PROXY_URL" >/dev/null 2>&1; then
-        dpkg -i /tmp/sing-box.deb >/dev/null 2>&1
-        echo "   ✅ 加速源安装成功!"
-        rm -f /tmp/sing-box.deb
-        return 0
-    fi
-
-    echo "❌ 错误: 所有安装方式均失败，请检查服务器网络是否能访问 GitHub。"
-    exit 1
+    return 1
 }
 
 echo ">>> [0/8] 深度清理..."
-pkill -9 sing-box || true
-pkill -9 python3 || true
 systemctl stop sbox-web sing-box || true
-rm -f /run/sing-box.pid
+# 不杀 python/singbox 进程，依靠 restart
 
 echo ">>> [1/8] 更新系统..."
 apt-get update -q
-apt-get install -y curl wget socat openssl ca-certificates python3 python3-venv python3-pip
+apt-get install -y curl wget socat openssl ca-certificates python3 python3-venv python3-pip net-tools
 apt-get install -y python3-flask python3-waitress >/dev/null 2>&1 || true
 
-# 执行增强版安装逻辑
-install_singbox
+install_singbox || { echo "❌ Sing-box 安装失败"; exit 1; }
 
-echo ">>> [3/8] 准备目录..."
+echo ">>> [3/8] 准备目录与密钥..."
 WORK_DIR="/root/sbox-relay"
 mkdir -p "$WORK_DIR/templates"
 cd "$WORK_DIR"
 
-KEYS=$(sing-box generate reality-keypair)
-PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey" | awk '{print $2}')
-PUBLIC_KEY=$(echo "$KEYS" | grep "PublicKey" | awk '{print $2}')
-SHORT_ID=$(openssl rand -hex 4)
+# [核心改进] v3.3: 密钥持久化
+KEY_FILE="$WORK_DIR/keys.conf"
+if [ -f "$KEY_FILE" ]; then
+    echo "   ♻️  检测到旧密钥，正在恢复..."
+    source "$KEY_FILE"
+else
+    echo "   🆕 生成新密钥..."
+    KEYS=$(sing-box generate reality-keypair)
+    PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey" | awk '{print $2}')
+    PUBLIC_KEY=$(echo "$KEYS" | grep "PublicKey" | awk '{print $2}')
+    SHORT_ID=$(openssl rand -hex 4)
+    # 保存
+    echo "PRIVATE_KEY=\"$PRIVATE_KEY\"" > "$KEY_FILE"
+    echo "PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$KEY_FILE"
+    echo "SHORT_ID=\"$SHORT_ID\"" >> "$KEY_FILE"
+fi
 HOST_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
 
 echo ">>> [5/8] 后端程序..."
@@ -99,13 +75,20 @@ import os
 import subprocess
 import uuid
 import base64
-from flask import Flask, render_template, request, redirect
+import secrets
+import time
+from functools import wraps
+from flask import Flask, render_template, request, redirect, session, url_for, flash
 
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(16)
 WORK_DIR = "/root/sbox-relay"
 DATA_FILE = f"{WORK_DIR}/data.json"
+ADMIN_FILE = f"{WORK_DIR}/admin.json"
 SBOX_CONFIG = "/etc/sing-box/config.json"
 START_PORT = 30000 
+LOCAL_VLESS_PORT = 10086
+LOCAL_SOCKS_PORT = 10087
 
 PRIVATE_KEY = "${PRIVATE_KEY}"
 PUBLIC_KEY = "${PUBLIC_KEY}"
@@ -116,55 +99,108 @@ def run_cmd(cmd):
     try:
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
-    except:
-        return False
+    except: return False
+
+def load_admin():
+    if not os.path.exists(ADMIN_FILE): return None
+    try:
+        with open(ADMIN_FILE, 'r') as f: 
+            data = json.load(f)
+            if 'system_uuid' not in data:
+                data['system_uuid'] = str(uuid.uuid4())
+                with open(ADMIN_FILE, 'w') as fw: json.dump(data, fw)
+            return data
+    except: return None
+
+def save_admin(username, password):
+    curr = load_admin()
+    sys_uuid = curr['system_uuid'] if curr else str(uuid.uuid4())
+    with open(ADMIN_FILE, 'w') as f:
+        json.dump({"username": username, "password": password, "system_uuid": sys_uuid}, f)
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        admin = load_admin()
+        if not admin: return redirect(url_for('setup'))
+        if 'logged_in' not in session: return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    if load_admin(): return redirect(url_for('login'))
+    if request.method == 'POST':
+        user = request.form.get('username')
+        pwd = request.form.get('password')
+        if user and pwd:
+            save_admin(user, pwd)
+            update_firewall(0, "local_init")
+            generate_sbox_config(load_data())
+            session['logged_in'] = True
+            return redirect('/')
+    return render_template('setup.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if not load_admin(): return redirect(url_for('setup'))
+    error = None
+    if request.method == 'POST':
+        u = request.form.get('username')
+        p = request.form.get('password')
+        admin = load_admin()
+        if u == admin['username'] and p == admin['password']:
+            session['logged_in'] = True; session.permanent = True
+            return redirect('/')
+        else:
+            time.sleep(2); error = "账号或密码错误"
+    return render_template('login.html', error=error)
+
+@app.route('/update_password', methods=['POST'])
+@login_required
+def update_password():
+    admin = load_admin()
+    if admin['password'] != request.form.get('old_password'): return "密码错误", 400
+    save_admin(admin['username'], request.form.get('new_password'))
+    generate_sbox_config(load_data())
+    return redirect('/')
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect(url_for('login'))
 
 def check_service_status():
-    status = "unknown"
-    logs = ""
+    status = "stopped"; logs = ""
     try:
-        code = subprocess.call("systemctl is-active --quiet sing-box", shell=True)
-        if code == 0:
-            status = "running"
-        else:
-            status = "stopped"
-            try: logs = subprocess.check_output("journalctl -u sing-box -n 20 --no-pager", shell=True).decode()
-            except: logs = "无法获取日志"
+        if subprocess.call("systemctl is-active --quiet sing-box", shell=True) == 0: status = "running"
+        logs = subprocess.check_output("journalctl -u sing-box -n 20 --no-pager", shell=True).decode()
     except: pass
     return status, logs
 
 def update_firewall(base_port, action):
-    base_port = int(base_port)
-    ports = [base_port, base_port + 1]
+    ports = [LOCAL_VLESS_PORT, LOCAL_SOCKS_PORT] if action == "local_init" else [int(base_port), int(base_port)+1]
+    if action == "local_init": action = "allow"
     
+    # 简化版防火墙逻辑
     has_ufw = run_cmd("command -v ufw")
-    has_iptables = run_cmd("command -v iptables")
-    
+    # v3.3: 修复 UFW 判断逻辑
     ufw_active = False
     if has_ufw:
         try:
-            if "status: active" in subprocess.check_output("ufw status", shell=True).decode().lower():
-                ufw_active = True
+           if "status: active" in subprocess.check_output("ufw status", shell=True).decode().lower(): ufw_active = True
         except: pass
 
     for port in ports:
         if action == "allow":
-            if ufw_active:
-                run_cmd(f"ufw allow {port}/tcp")
-                run_cmd(f"ufw allow {port}/udp")
-            elif has_iptables:
+            if ufw_active: run_cmd(f"ufw allow {port}/tcp"); run_cmd(f"ufw allow {port}/udp")
+            else:
                 run_cmd(f"iptables -C INPUT -p tcp --dport {port} -j ACCEPT || iptables -I INPUT -p tcp --dport {port} -j ACCEPT")
                 run_cmd(f"iptables -C INPUT -p udp --dport {port} -j ACCEPT || iptables -I INPUT -p udp --dport {port} -j ACCEPT")
-        elif action == "delete":
-            if ufw_active:
-                run_cmd(f"ufw delete allow {port}/tcp")
-                run_cmd(f"ufw delete allow {port}/udp")
-            elif has_iptables:
+        else:
+            if ufw_active: run_cmd(f"ufw delete allow {port}/tcp"); run_cmd(f"ufw delete allow {port}/udp")
+            else:
                 run_cmd(f"iptables -D INPUT -p tcp --dport {port} -j ACCEPT")
                 run_cmd(f"iptables -D INPUT -p udp --dport {port} -j ACCEPT")
-    
-    if not ufw_active and has_iptables:
-       run_cmd("netfilter-persistent save || service iptables save || true")
+    if not ufw_active: run_cmd("netfilter-persistent save 2>/dev/null || service iptables save 2>/dev/null || true")
 
 def load_data():
     if not os.path.exists(DATA_FILE): return []
@@ -176,300 +212,141 @@ def save_data(data):
     with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2)
 
 def generate_sbox_config(rules):
+    admin = load_admin()
+    socks_users = [{"username": admin['username'], "password": admin['password']}] if admin else []
+    sys_uuid = admin['system_uuid'] if admin else str(uuid.uuid4())
+
     config = {
         "log": {"level": "info", "output": "/var/log/sing-box.log"},
-        "dns": {
-            "servers": [{"tag": "google", "address": "8.8.8.8"}, {"tag": "local", "address": "local", "detour": "direct"}]
-        },
-        "inbounds": [],
+        "dns": {"servers": [{"tag": "google", "address": "8.8.8.8"}, {"tag": "local", "address": "local", "detour": "direct"}]},
+        "inbounds": [
+            {"type": "socks", "tag": "keep_alive", "listen": "127.0.0.1", "listen_port": 64000},
+            {"type": "vless", "tag": "local_vless", "listen": "0.0.0.0", "listen_port": LOCAL_VLESS_PORT, "users": [{"uuid": sys_uuid, "flow": "xtls-rprx-vision"}], "tls": {"enabled": True, "server_name": "www.microsoft.com", "reality": {"enabled": True, "handshake":{"server":"www.microsoft.com","server_port":443},"private_key":PRIVATE_KEY,"short_id":[SHORT_ID]}}},
+            {"type": "socks", "tag": "local_socks", "listen": "0.0.0.0", "listen_port": LOCAL_SOCKS_PORT, "users": socks_users}
+        ],
         "outbounds": [{"type":"direct","tag":"direct"}, {"type":"block","tag":"block"}],
-        "route": {"rules": [], "final": "direct"}
+        "route": {"rules": [{"inbound": ["local_vless", "local_socks"], "outbound": "direct"}], "final": "direct"}
     }
     
     for rule in rules:
-        port_vless = int(rule['port'])
-        port_socks = port_vless + 1
-        
-        in_tag_vless = f"in_vless_{port_vless}"
-        in_tag_socks = f"in_sock_{port_socks}"
-        out_tag = f"out_{port_vless}"
-
-        # 1. VLESS (0.0.0.0 IPv4)
-        config['inbounds'].append({
-            "type": "vless",
-            "tag": in_tag_vless,
-            "listen": "0.0.0.0",
-            "listen_port": port_vless,
-            "users": [{"uuid": rule['uuid'], "flow": "xtls-rprx-vision"}],
-            "tls": {
-                "enabled": True, "server_name": "www.microsoft.com",
-                "reality": {"enabled": True, "handshake":{"server":"www.microsoft.com","server_port":443},"private_key":PRIVATE_KEY,"short_id":[SHORT_ID]}
-            }
-        })
-        
-        # 2. Socks5 入站 (0.0.0.0 IPv4)
-        config['inbounds'].append({
-            "type": "socks",
-            "tag": in_tag_socks,
-            "listen": "0.0.0.0",
-            "listen_port": port_socks
-        })
-
-        # 3. 出站
-        outbound = {
-            "type": "socks", "tag": out_tag, "server": rule['s_ip'], "server_port": int(rule['s_port'])
-        }
-        if rule.get('s_user'):
-            outbound['username'] = rule['s_user']; outbound['password'] = rule['s_pass']
-        config['outbounds'].insert(0, outbound)
-
-        # 4. 路由
-        config['route']['rules'].insert(0, {
-            "inbound": [in_tag_vless, in_tag_socks], "outbound": out_tag
-        })
+        pv = int(rule['port']); ps = pv + 1
+        config['inbounds'].append({"type": "vless", "tag": f"in_vl_{pv}", "listen": "0.0.0.0", "listen_port": pv, "users": [{"uuid": rule['uuid'], "flow": "xtls-rprx-vision"}], "tls": {"enabled": True, "server_name": "www.microsoft.com", "reality": {"enabled": True, "handshake":{"server":"www.microsoft.com","server_port":443},"private_key":PRIVATE_KEY,"short_id":[SHORT_ID]}}})
+        sb_in = {"type": "socks", "tag": f"in_sk_{ps}", "listen": "0.0.0.0", "listen_port": ps}; 
+        if socks_users: sb_in["users"] = socks_users
+        config['inbounds'].append(sb_in)
+        config['outbounds'].insert(0, {"type": "socks", "tag": f"out_{pv}", "server": rule['s_ip'], "server_port": int(rule['s_port']), "username": rule.get('s_user',''), "password": rule.get('s_pass','')})
+        config['route']['rules'].insert(0, {"inbound": [f"in_vl_{pv}", f"in_sk_{ps}"], "outbound": f"out_{pv}"})
 
     with open(SBOX_CONFIG, 'w') as f: json.dump(config, f, indent=2)
     run_cmd("systemctl reload sing-box || systemctl restart sing-box")
 
+# ... (parse_link, get_next_port are same) ...
 def parse_link(link):
-    link = link.strip()
+    link = link.strip(); 
     if not link.startswith("socks5://"):
-        try:
-            padded = link + "=" * (-len(link) % 4)
-            decoded = base64.urlsafe_b64decode(padded).decode('utf-8')
-            if decoded.startswith("socks5://"): link = decoded
+        try: link = base64.urlsafe_b64decode(link+"="*(-len(link)%4)).decode()
         except: pass
-
-    content = link.replace("socks5://", "")
-    user = ""
-    password = ""
-    host = ""
-    port = ""
-    if "@" in content:
-        auth_part, host_part = content.split("@", 1)
-        if ":" in auth_part: user, password = auth_part.split(":", 1)
-        else: user = auth_part
-    else: host_part = content
-    if "#" in host_part: host_part = host_part.split("#")[0] 
-    if ":" in host_part: host, port_str = host_part.split(":", 1)
-    else: raise ValueError("无效端口") 
-    return {"s_ip": host, "s_port": int(port_str), "s_user": user, "s_pass": password}
+    c = link.replace("socks5://", ""); u=p=h=pt=""
+    if "@" in c: a, h = c.split("@", 1); u, p = a.split(":", 1) if ":" in a else (a, "")
+    h = h.split("#")[0]
+    if ":" in h: h, pt = h.split(":", 1)
+    else: return {"s_ip":h, "s_port":0, "s_user":u, "s_pass":p} # Fallback
+    return {"s_ip": h, "s_port": int(pt), "s_user": u, "s_pass": p}
 
 def get_next_port(rules):
-    used_ports = [int(r['port']) for r in rules]
-    candidate = START_PORT
-    while candidate in used_ports: candidate += 2 
-    return candidate
+    used = [int(r['port']) for r in rules]
+    c = START_PORT; 
+    while c in used: c += 2 
+    return c
 
 @app.route('/')
+@login_required 
 def index():
-    rules = load_data()
-    try: current_ip = subprocess.check_output("curl -s ifconfig.me", shell=True).decode().strip()
-    except: current_ip = HOST_IP
-
+    rules = load_data(); admin = load_admin()
+    try: cip = subprocess.check_output("curl -s ifconfig.me", shell=True).decode().strip()
+    except: cip = HOST_IP
+    lv = f"vless://{admin['system_uuid']}@{cip}:{LOCAL_VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk={PUBLIC_KEY}&sid={SHORT_ID}#本机直连VLESS"
+    ls = f"socks5://{admin['username']}:{admin['password']}@{cip}:{LOCAL_SOCKS_PORT}#本机直连Socks5"
     for r in rules:
-        r['link_vless'] = f"vless://{r['uuid']}@{current_ip}:{r['port']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk={PUBLIC_KEY}&sid={SHORT_ID}#{r['remark']}"
+        r['link_vless'] = f"vless://{r['uuid']}@{cip}:{r['port']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk={PUBLIC_KEY}&sid={SHORT_ID}#{r['remark']}"
         r['socks_port'] = int(r['port']) + 1
-        r['link_socks'] = f"socks5://{current_ip}:{r['socks_port']}#{r['remark']}_NoAuth"
-    
-    svc_status, svc_logs = check_service_status()
-    if not rules and svc_status != 'running' and not os.path.exists(SBOX_CONFIG):
-         generate_sbox_config([])
-         svc_status, svc_logs = check_service_status()
-
-    return render_template('index.html', rules=rules, server_ip=current_ip, svc_status=svc_status, svc_logs=svc_logs)
+        r['link_socks'] = f"socks5://{admin['username']}:{admin['password']}@{cip}:{r['socks_port']}#{r['remark']}"
+    st, lg = check_service_status()
+    # v3.3: 任何情况下都显示页面
+    return render_template('index.html', rules=rules, server_ip=cip, svc_status=st, svc_logs=lg, username=admin['username'], local_vless=lv, local_socks=ls)
 
 @app.route('/test/<id>')
+@login_required
 def diagnostics(id):
-    rules = load_data()
-    r = next((x for x in rules if x['id'] == id), None)
-    if not r: return "Rule not found"
-    local_socks_port = int(r['port']) + 1
-    # 诊断命令
-    cmd = f"curl -x socks5h://127.0.0.1:{local_socks_port} -I https://www.google.com --connect-timeout 3"
+    rules = load_data(); admin = load_admin(); r = next((x for x in rules if x['id'] == id), None)
+    if not r: return "Err"
     try:
-        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-        if "200" in output or "301" in output or "302" in output:
-            return f"✅ 自检成功! <br>如果要从外面连，请找云服务商放行端口 {local_socks_port}"
-        else:
-            return f"⚠️ 自检失败: <br>{output}"
-    except subprocess.CalledProcessError as e:
-        return f"❌ 严重错误: {e.output.decode()}"
+        o = subprocess.check_output(f"curl -x socks5://{admin['username']}:{admin['password']}@127.0.0.1:{int(r['port'])+1} -I https://www.google.com --connect-timeout 3", shell=True, stderr=subprocess.STDOUT).decode()
+        if "200" in o or "301" in o: return "✅ 通!"
+        return f"⚠️ 失败: {o}"
+    except Exception as e: return f"❌ {e}"
 
 @app.route('/add', methods=['POST'])
+@login_required
 def add():
     rules = load_data()
     try:
-        remark = request.form.get('remark')
-        sub_link = request.form.get('sub_link')
-        info = parse_link(sub_link)
-        port = get_next_port(rules)
-        new_rule = {
-            "id": str(uuid.uuid4())[:8], "remark": remark, "port": port, "uuid": str(uuid.uuid4()),
-            "s_ip": info['s_ip'], "s_port": info['s_port'], "s_user": info['s_user'], "s_pass": info['s_pass']
-        }
-        update_firewall(port, "allow")
-        rules.append(new_rule)
-        save_data(rules)
-        generate_sbox_config(rules)
-    except Exception as e:
-        return f"Error: {str(e)}", 400
+        i = parse_link(request.form.get('sub_link')); p = get_next_port(rules); update_firewall(p, "allow")
+        rules.append({"id": str(uuid.uuid4())[:8], "remark": request.form.get('remark'), "port": p, "uuid": str(uuid.uuid4()), **i})
+        save_data(rules); generate_sbox_config(rules)
+    except Exception as e: return f"{e}", 400
     return redirect('/')
 
 @app.route('/del/<id>')
+@login_required
 def delete(id):
-    rules = load_data()
-    target = next((r for r in rules if r['id'] == id), None)
-    if target:
-        update_firewall(target['port'], "delete")
-        rules = [r for r in rules if r['id'] != id]
-        save_data(rules)
-        generate_sbox_config(rules)
-    return redirect('/')
-
-@app.route('/restart')
-def restart_svc():
-    run_cmd("systemctl restart sing-box")
+    r = load_data(); t = next((x for x in r if x['id'] == id), None)
+    if t: update_firewall(t['port'], "delete"); r = [x for x in r if x['id'] != id]; save_data(r); generate_sbox_config(r)
     return redirect('/')
 
 if __name__ == '__main__':
     from waitress import serve
-    if os.path.exists(DATA_FILE):
-        generate_sbox_config(load_data())
+    update_firewall(0, "local_init")
+    # v3.3 强制刷新配置，确保新端口生效
+    generate_sbox_config(load_data()) 
     serve(app, host='0.0.0.0', port=5000)
 EOF
 
-echo ">>> [5.5/8] Python依赖..."
-python3 -c "import flask, waitress" >/dev/null 2>&1 || {
-  python3 -m venv "$WORK_DIR/venv"
-  "$WORK_DIR/venv/bin/pip" -q install -U pip
-  "$WORK_DIR/venv/bin/pip" -q install flask waitress
-}
-
-echo ">>> [6/8] 前端..."
-# 使用相同的 HTML 模板，不再赘述，保持与 v2.4 一致
+echo ">>> [6/8] 前端页面 (使用 v3.2 模板)..."
+# 略过重复 HTML 输出，假设 HTML 不变 (见 v3.2)
+# 这里为了确保脚本独立完整，还是得写一遍
+cat > "$WORK_DIR/templates/setup.html" <<'HTML_EOF'
+<!DOCTYPE html><html><head><title>初始化</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{background:#f4f6f9;display:flex;align-items:center;justify-content:center;height:100vh}</style></head><body><div class="card shadow p-4" style="width:400px"><h3 class="text-center mb-3">🛠️ 初始化</h3><form action="/setup" method="POST"><div class="mb-3"><label>用户名</label><input type="text" name="username" class="form-control" placeholder="admin" required></div><div class="mb-3"><label>密码</label><input type="password" name="password" class="form-control" required></div><button type="submit" class="btn btn-primary w-100">启动</button></form></div></body></html>
+HTML_EOF
+cat > "$WORK_DIR/templates/login.html" <<'HTML_EOF'
+<!DOCTYPE html><html><head><title>登录</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{background:#f4f6f9;display:flex;align-items:center;justify-content:center;height:100vh}</style></head><body><div class="card shadow p-4" style="width:400px"><h3 class="text-center mb-3">🔐 登录</h3>{% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}<form action="/login" method="POST"><div class="mb-3"><label>用户名</label><input type="text" name="username" class="form-control" required></div><div class="mb-3"><label>密码</label><input type="password" name="password" class="form-control" required></div><button type="submit" class="btn btn-success w-100">登录</button></form></div></body></html>
+HTML_EOF
 cat > "$WORK_DIR/templates/index.html" <<'HTML_EOF'
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Socks5 中转面板</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>body{background:#f4f6f9;font-family:sans-serif;}.card{border:none;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,0.05);}
-    .link-box { cursor: pointer; background: #fff; font-family: monospace; font-size: 0.85rem; }
-    .status-ok { color: green; font-weight: bold; }
-    .status-err { color: red; font-weight: bold; }
-    </style>
-</head>
-<body>
-<div class="container py-5">
-    <div class="card mb-4">
-        <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">🚀 加速中转面板 (2.5 不死安装版)</h5>
-            <div>
-                IP: <strong>{{ server_ip }}</strong>
-                <span class="mx-2">|</span>
-                服务: 
-                {% if svc_status == 'running' %}
-                <span class="status-ok">运行中 ✅</span>
-                {% else %}
-                <span class="status-err">已停止 ❌</span>
-                <a href="/restart" class="btn btn-sm btn-outline-warning ms-2">重启</a>
-                {% endif %}
-            </div>
-        </div>
-        
-        {% if svc_status != 'running' %}
-        <div class="alert alert-danger m-3">
-            <strong>服务未响应 ({{svc_status}})</strong>
-            <pre class="mt-2 bg-light p-2 border rounded" style="max-height: 200px; overflow:auto;">{{ svc_logs }}</pre>
-        </div>
-        {% endif %}
-
-        <div class="card-body p-4">
-            <form action="/add" method="POST" class="row g-3 mb-4 pb-4 border-bottom">
-                <div class="col-md-3">
-                    <label class="form-label text-muted small">备注名</label>
-                    <input type="text" name="remark" class="form-control" placeholder="例如: 节点A" required>
-                </div>
-                <div class="col-md-9">
-                    <label class="form-label text-muted small">Socks5 订阅链接</label>
-                    <input type="text" name="sub_link" class="form-control" placeholder="socks5://..." required>
-                </div>
-                <div class="col-12 mt-3">
-                    <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">➕ 新增</button>
-                    <div class="small text-muted text-center mt-2">v2.5 多源极速安装 | 30000+ 端口 | 强制 IPv4</div>
-                </div>
-            </form>
-
-            <div class="table-responsive">
-                <table class="table table-hover align-middle">
-                    <thead class="table-light">
-                        <tr>
-                            <th scope="col">备注</th>
-                            <th scope="col">出口IP</th>
-                            <th scope="col">VLESS (No-Sniff)</th>
-                            <th scope="col">Socks5 (No-Auth)</th>
-                            <th scope="col" style="width:140px">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for r in rules %}
-                        <tr>
-                            <td><span class="badge bg-secondary">{{ r.remark }}</span></td>
-                            <td class="small">{{ r.s_ip }}</td>
-                            <td>
-                                <div class="input-group input-group-sm">
-                                    <span class="input-group-text bg-light">:{{ r.port }}</span>
-                                    <input type="text" class="form-control link-box text-success" 
-                                           value="{{ r.link_vless }}" readonly
-                                           onclick="this.select();document.execCommand('copy')">
-                                </div>
-                            </td>
-                            <td>
-                                <div class="input-group input-group-sm">
-                                    <span class="input-group-text bg-light">:{{ r.socks_port }}</span>
-                                    <input type="text" class="form-control link-box text-danger" 
-                                           value="{{ r.link_socks }}" readonly
-                                           onclick="this.select();document.execCommand('copy')">
-                                </div>
-                            </td>
-                            <td>
-                                <a href="/test/{{ r.id }}" target="_blank" class="btn btn-outline-info btn-sm">自检</a>
-                                <a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">退订</a>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-</div>
-</body>
-</html>
+<!DOCTYPE html><html><head><title>中转面板</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script><style>body{background:#f4f6f9;}.status-ok{color:green}.status-err{color:red}</style></head>
+<body><div class="container py-5"><div class="card shadow mb-4"><div class="card-header bg-white"><h5 class="mb-0">🏠 本机直连节点</h5></div><div class="card-body"><div class="row g-3"><div class="col-md-6"><label class="small text-muted">VLESS (端口 10086)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-success fw-bold" value="{{ local_vless }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div><div class="col-md-6"><label class="small text-muted">Socks5 (端口 10087)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-primary fw-bold" value="{{ local_socks }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div></div></div></div>
+<div class="card shadow"><div class="card-header bg-white py-3 d-flex justify-content-between align-items-center"><h5 class="mb-0">📡 转发规则</h5><div><span class="badge bg-light text-dark border me-2">{{ username }}</span>{% if svc_status == 'running' %}<span class="status-ok fw-bold me-3">运行中 ✅</span>{% else %}<span class="status-err fw-bold me-3">已停止</span>{% endif %}<button class="btn btn-sm btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#pwdModal">改密</button><a href="/logout" class="btn btn-sm btn-outline-secondary">退出</a></div></div>
+{% if svc_status != 'running' %}<div class="alert alert-danger m-3"><pre class="mb-0">{{ svc_logs }}</pre></div>{% endif %}
+<div class="card-body"><form action="/add" method="POST" class="row g-2 mb-4 border-bottom pb-4"><div class="col-md-3"><input type="text" name="remark" class="form-control" placeholder="备注名" required></div><div class="col-md-7"><input type="text" name="sub_link" class="form-control" placeholder="上游 Socks5 链接" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary w-100">新增转发</button></div></form>
+<table class="table table-hover align-middle"><thead><tr><th>备注</th><th>出口IP</th><th>转发 VLESS / Socks5</th><th>操作</th></tr></thead><tbody>{% for r in rules %}<tr><td><span class="badge bg-secondary">{{ r.remark }}</span></td><td class="small">{{ r.s_ip }}</td><td><div class="input-group input-group-sm mb-1"><span class="input-group-text">VL :{{ r.port }}</span><input type="text" class="form-control" value="{{ r.link_vless }}" readonly onclick="this.select();document.execCommand('copy')"></div><div class="input-group input-group-sm"><span class="input-group-text">S5 :{{ r.socks_port }}</span><input type="text" class="form-control" value="{{ r.link_socks }}" readonly onclick="this.select();document.execCommand('copy')"></div></td><td><a href="/test/{{ r.id }}" target="_blank" class="btn btn-outline-info btn-sm">自检</a> <a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删</a></td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="modal fade" id="pwdModal"><div class="modal-dialog"><div class="modal-content"><form action="/update_password" method="POST"><div class="modal-header"><h5 class="modal-title">修改密码</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label>当前密码</label><input type="password" name="old_password" class="form-control" required></div><div class="mb-3"><label>新密码</label><input type="password" name="new_password" class="form-control" required></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">确认修改</button></div></form></div></div></div></body></html>
 HTML_EOF
 
 echo ">>> [7/8] 系统服务..."
 PYBIN="/usr/bin/python3"
 [ -x "$WORK_DIR/venv/bin/python" ] && PYBIN="$WORK_DIR/venv/bin/python"
-
 cat > /etc/systemd/system/sbox-web.service <<EOF
 [Unit]
 Description=Singbox Web Panel
 After=network.target
-
 [Service]
 User=root
 WorkingDirectory=$WORK_DIR
 ExecStart=$PYBIN app.py
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 mkdir -p /etc/systemd/system/sing-box.service.d
 cat > /etc/systemd/system/sing-box.service.d/override.conf <<EOF
 [Service]
@@ -477,28 +354,14 @@ User=root
 Group=root
 StartLimitIntervalSec=0
 EOF
-
-touch /var/log/sing-box.log
-chmod 666 /var/log/sing-box.log || true
+touch /var/log/sing-box.log; chmod 666 /var/log/sing-box.log || true
 
 echo ">>> [8/8] 放行端口..."
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-  ufw allow 5000/tcp >/dev/null 2>&1 || true
-else
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p tcp --dport 5000 -j ACCEPT >/dev/null 2>&1 || \
-      iptables -I INPUT -p tcp --dport 5000 -j ACCEPT
-  fi
-fi
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow 5000/tcp >/dev/null 2>&1 || true; else if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p tcp --dport 5000 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 5000 -j ACCEPT; fi; fi
 
-systemctl daemon-reload
-systemctl enable sbox-web sing-box >/dev/null 2>&1
-systemctl restart sbox-web sing-box
-
+systemctl daemon-reload; systemctl enable sbox-web sing-box >/dev/null 2>&1; systemctl restart sbox-web sing-box
 IP=$(curl -s ifconfig.me || echo "$HOST_IP")
-echo ""
-echo "=========================================================="
-echo "✅ 2.5 不死安装版安装成功！"
-echo "♻️  已自动修复 curl TLS 报错"
-echo "📂 后台地址: http://${IP}:5000"
-echo "=========================================================="
+echo ""; echo "✅ v3.3 密钥固化版安装成功！"
+echo "♻️  Reality 密钥已保存，下次升级不会丢失连接！"
+echo "🛠️  端口状态:"
+netstat -nlp | grep sing-box | awk '{print "    " $4 "\t(PID " $7 ")"}'
