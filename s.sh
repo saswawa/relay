@@ -1,10 +1,3 @@
-#!/bin/bash
-
-# ==========================================
-# Socks5 转 VLESS 极简中转面板 (最终修复版)
-# 适用系统: Debian 10/11/12, Ubuntu 20/22
-# ==========================================
-
 # 1. 强制检查 Root 权限
 if [ "$EUID" -ne 0 ]; then
   echo "❌ 错误: 请使用 'sudo -i' 切换到 root 用户后再运行此脚本！"
@@ -122,7 +115,6 @@ def generate_sbox_config(rules):
 @app.route('/')
 def index():
     rules = load_data()
-    # 尝试重新获取最新IP(防止IP变动)
     try:
         current_ip = subprocess.check_output("curl -s ifconfig.me", shell=True).decode().strip()
     except:
@@ -247,8 +239,9 @@ cat > "$WORK_DIR/templates/index.html" <<HTML_EOF
 </html>
 HTML_EOF
 
-echo ">>> [7/8] 配置系统服务 (使用 Root 运行)..."
-# 这里的关键修复：强制 User=root，解决权限报错
+echo ">>> [7/8] 配置系统服务..."
+
+# 1. 创建面板服务
 cat > /etc/systemd/system/sbox-web.service <<EOF
 [Unit]
 Description=Singbox Web Panel
@@ -256,7 +249,7 @@ After=network.target
 
 [Service]
 User=root
-WorkingDirectory=$WORK_DIR
+WorkingDirectory=/root/sbox-relay
 ExecStart=/usr/bin/python3 app.py
 Restart=always
 
@@ -264,30 +257,57 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-# 强制 Sing-box 也以 Root 运行 (解决日志权限问题)
+# 2. 修改 Sing-box 权限 (解决 Trixie 上的日志与内核权限报错)
 sed -i 's/User=sing-box/User=root/g' /lib/systemd/system/sing-box.service
 sed -i 's/Group=sing-box/Group=root/g' /lib/systemd/system/sing-box.service
 
-# 创建日志文件并给权限
+# 3. 初始化日志文件
 touch /var/log/sing-box.log
 chmod 777 /var/log/sing-box.log
 
-echo ">>> [8/8] 开放防火墙并启动..."
-# 暴力放行所有端口
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
-iptables -F
-# 简单的 iptables 持久化 (可选)
-apt-get install -y iptables-persistent >/dev/null 2>&1
-
+# 4. 重载服务引擎
 systemctl daemon-reload
-systemctl enable sbox-web sing-box >/dev/null 2>&1
+
+echo ">>> [8/8] 正在开放端口并启动..."
+
+# 1. 开放防火墙端口 (面板 5000 + 默认常用的中转端口范围)
+if command -v ufw >/dev/null; then
+    ufw allow 5000/tcp
+    ufw allow 20000:30000/tcp
+    ufw allow 20000:30000/udp
+fi
+
+# 2. 启动服务并设置自启
+systemctl enable sbox-web sing-box
 systemctl restart sbox-web sing-box
 
-IP=$(curl -s ifconfig.me)
-echo ""
-echo "=========================================================="
-echo "✅ 安装成功！完美修复版已就绪。"
-echo "📂 后台地址: http://${IP}:5000"
-echo "=========================================================="
+echo "------------------------------------------------"
+echo "✅ 全部部署完成！"
+echo "🌐 管理面板地址: http://${HOST_IP}:5000"
+echo "🔑 初始 Reality 公钥: ${PUBLIC_KEY}"
+echo "------------------------------------------------"
+
+# 1. 创建目录
+mkdir -p /etc/sing-box
+
+# 2. 写入最简基础配置
+cat > /etc/sing-box/config.json <<EOF
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": []
+  }
+}
+EOF
+
+# 3. 再次尝试启动
+systemctl restart sing-box
