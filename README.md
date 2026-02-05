@@ -1,7 +1,7 @@
 一键脚本：
-
+```bash
 apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')
-
+```
 
 # Socks5 转 VLESS 极简中转面板 (Socks5 to VLESS Relay Panel)
 
