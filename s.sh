@@ -2,12 +2,12 @@
 set -e
 
 # ==========================================
-# Socks5 转 VLESS 极简中转面板 (v3.3 密钥固化版)
+# Socks5 转 VLESS 极简中转面板 (v3.4 链接优化版)
 # 变更日志:
-# 3.3: 修复 10086/10087 端口不启动的问题 (强制刷新配置)
-#      新增 [密钥持久化]：升级脚本不再改变 Reality 密钥，旧链接永久有效
-# 3.2: 本机直连节点
-# 3.1: 修改密码 + 防爆破
+# 3.4: 修复 [本机直连] 端口在未设置密码时不启动的 Bug (users: [])
+#      优化一键安装体验
+# 3.3: 密钥固化 (升级不换号)
+# 3.2: 本机直连节点 (10086/10087)
 # ==========================================
 
 sed -i 's/\r$//' "$0" 2>/dev/null || true
@@ -36,7 +36,6 @@ install_singbox() {
 
 echo ">>> [0/8] 深度清理..."
 systemctl stop sbox-web sing-box || true
-# 不杀 python/singbox 进程，依靠 restart
 
 echo ">>> [1/8] 更新系统..."
 apt-get update -q
@@ -50,7 +49,6 @@ WORK_DIR="/root/sbox-relay"
 mkdir -p "$WORK_DIR/templates"
 cd "$WORK_DIR"
 
-# [核心改进] v3.3: 密钥持久化
 KEY_FILE="$WORK_DIR/keys.conf"
 if [ -f "$KEY_FILE" ]; then
     echo "   ♻️  检测到旧密钥，正在恢复..."
@@ -61,7 +59,6 @@ else
     PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey" | awk '{print $2}')
     PUBLIC_KEY=$(echo "$KEYS" | grep "PublicKey" | awk '{print $2}')
     SHORT_ID=$(openssl rand -hex 4)
-    # 保存
     echo "PRIVATE_KEY=\"$PRIVATE_KEY\"" > "$KEY_FILE"
     echo "PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$KEY_FILE"
     echo "SHORT_ID=\"$SHORT_ID\"" >> "$KEY_FILE"
@@ -180,9 +177,7 @@ def update_firewall(base_port, action):
     ports = [LOCAL_VLESS_PORT, LOCAL_SOCKS_PORT] if action == "local_init" else [int(base_port), int(base_port)+1]
     if action == "local_init": action = "allow"
     
-    # 简化版防火墙逻辑
     has_ufw = run_cmd("command -v ufw")
-    # v3.3: 修复 UFW 判断逻辑
     ufw_active = False
     if has_ufw:
         try:
@@ -222,11 +217,16 @@ def generate_sbox_config(rules):
         "inbounds": [
             {"type": "socks", "tag": "keep_alive", "listen": "127.0.0.1", "listen_port": 64000},
             {"type": "vless", "tag": "local_vless", "listen": "0.0.0.0", "listen_port": LOCAL_VLESS_PORT, "users": [{"uuid": sys_uuid, "flow": "xtls-rprx-vision"}], "tls": {"enabled": True, "server_name": "www.microsoft.com", "reality": {"enabled": True, "handshake":{"server":"www.microsoft.com","server_port":443},"private_key":PRIVATE_KEY,"short_id":[SHORT_ID]}}},
-            {"type": "socks", "tag": "local_socks", "listen": "0.0.0.0", "listen_port": LOCAL_SOCKS_PORT, "users": socks_users}
         ],
         "outbounds": [{"type":"direct","tag":"direct"}, {"type":"block","tag":"block"}],
         "route": {"rules": [{"inbound": ["local_vless", "local_socks"], "outbound": "direct"}], "final": "direct"}
     }
+
+    # v3.4 Fix: 本机 Socks5 -- 如果没用户(未初始化)则无Auth，如果有则Auth
+    # 避免由空列表导致的报错
+    local_socks_in = {"type": "socks", "tag": "local_socks", "listen": "0.0.0.0", "listen_port": LOCAL_SOCKS_PORT}
+    if socks_users: local_socks_in["users"] = socks_users
+    config["inbounds"].append(local_socks_in)
     
     for rule in rules:
         pv = int(rule['port']); ps = pv + 1
@@ -240,7 +240,7 @@ def generate_sbox_config(rules):
     with open(SBOX_CONFIG, 'w') as f: json.dump(config, f, indent=2)
     run_cmd("systemctl reload sing-box || systemctl restart sing-box")
 
-# ... (parse_link, get_next_port are same) ...
+# ... (rest same as v3.3) ...
 def parse_link(link):
     link = link.strip(); 
     if not link.startswith("socks5://"):
@@ -250,7 +250,7 @@ def parse_link(link):
     if "@" in c: a, h = c.split("@", 1); u, p = a.split(":", 1) if ":" in a else (a, "")
     h = h.split("#")[0]
     if ":" in h: h, pt = h.split(":", 1)
-    else: return {"s_ip":h, "s_port":0, "s_user":u, "s_pass":p} # Fallback
+    else: return {"s_ip":h, "s_port":0, "s_user":u, "s_pass":p}
     return {"s_ip": h, "s_port": int(pt), "s_user": u, "s_pass": p}
 
 def get_next_port(rules):
@@ -272,7 +272,6 @@ def index():
         r['socks_port'] = int(r['port']) + 1
         r['link_socks'] = f"socks5://{admin['username']}:{admin['password']}@{cip}:{r['socks_port']}#{r['remark']}"
     st, lg = check_service_status()
-    # v3.3: 任何情况下都显示页面
     return render_template('index.html', rules=rules, server_ip=cip, svc_status=st, svc_logs=lg, username=admin['username'], local_vless=lv, local_socks=ls)
 
 @app.route('/test/<id>')
@@ -307,14 +306,11 @@ def delete(id):
 if __name__ == '__main__':
     from waitress import serve
     update_firewall(0, "local_init")
-    # v3.3 强制刷新配置，确保新端口生效
     generate_sbox_config(load_data()) 
     serve(app, host='0.0.0.0', port=5000)
 EOF
 
 echo ">>> [6/8] 前端页面 (使用 v3.2 模板)..."
-# 略过重复 HTML 输出，假设 HTML 不变 (见 v3.2)
-# 这里为了确保脚本独立完整，还是得写一遍
 cat > "$WORK_DIR/templates/setup.html" <<'HTML_EOF'
 <!DOCTYPE html><html><head><title>初始化</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{background:#f4f6f9;display:flex;align-items:center;justify-content:center;height:100vh}</style></head><body><div class="card shadow p-4" style="width:400px"><h3 class="text-center mb-3">🛠️ 初始化</h3><form action="/setup" method="POST"><div class="mb-3"><label>用户名</label><input type="text" name="username" class="form-control" placeholder="admin" required></div><div class="mb-3"><label>密码</label><input type="password" name="password" class="form-control" required></div><button type="submit" class="btn btn-primary w-100">启动</button></form></div></body></html>
 HTML_EOF
@@ -361,7 +357,8 @@ if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
 
 systemctl daemon-reload; systemctl enable sbox-web sing-box >/dev/null 2>&1; systemctl restart sbox-web sing-box
 IP=$(curl -s ifconfig.me || echo "$HOST_IP")
-echo ""; echo "✅ v3.3 密钥固化版安装成功！"
-echo "♻️  Reality 密钥已保存，下次升级不会丢失连接！"
+echo ""; echo "✅ v3.4 链接优化版安装成功！"
 echo "🛠️  端口状态:"
 netstat -nlp | grep sing-box | awk '{print "    " $4 "\t(PID " $7 ")"}'
+echo "👉 您的永久一键脚本命令: "
+echo "bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')"
