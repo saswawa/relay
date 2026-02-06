@@ -252,6 +252,18 @@ def generate_sbox_config(rules):
             out.update({"type": "hysteria2", "server": rule.get('server', rule.get('s_ip')), "server_port": int(rule.get('server_port', rule.get('s_port'))), "password": rule.get('password',''), "tls": {"enabled": True, "server_name": rule.get('sni', rule.get('server', rule.get('s_ip'))), "insecure": rule.get('insecure', False)}})
             if rule.get('obfs'): out['obfs'] = {"type": "salamander", "password": rule.get('obfs_password')}
 
+        elif otyp == 'vmess':
+            out.update({"type": "vmess", "server": rule.get('server'), "server_port": int(rule.get('server_port')), "uuid": rule.get('uuid_remote'), "security": rule.get('security', 'auto'), "alter_id": int(rule.get('alter_id', 0))})
+            transport = {"type": rule.get('net', 'tcp')}
+            if rule.get('net') == 'ws':
+                transport['path'] = rule.get('path', '/')
+                if rule.get('host'): transport['headers'] = {'Host': rule.get('host')}
+            elif rule.get('net') == 'grpc':
+                transport['service_name'] = rule.get('path', '')
+            out['transport'] = transport
+            if rule.get('tls') == 'tls':
+                out['tls'] = {"enabled": True, "server_name": rule.get('sni', rule.get('host', rule.get('server'))), "insecure": True}
+
         else: # socks
             out.update({"type": "socks", "server": rule['s_ip'], "server_port": int(rule['s_port']), "username": rule.get('s_user',''), "password": rule.get('s_pass','')})
             
@@ -283,6 +295,18 @@ def parse_link(link):
         q = urllib.parse.parse_qs(u.query)
         base.update({"type": "hysteria2", "password": u.username or "", "sni": q.get('sni', [u.hostname])[0], "insecure": q.get('insecure',['0'])[0]=='1', "obfs": q.get('obfs',[''])[0], "obfs_password": q.get('obfs-password',[''])[0]})
         return base
+    elif scheme == 'vmess':
+        try:
+            b64 = link.replace("vmess://", "")
+            js = json.loads(base64.urlsafe_b64decode(b64+"="*(-len(b64)%4)).decode())
+            base.update({
+                "type": "vmess", "server": js.get('add'), "server_port": js.get('port'), "s_ip": js.get('add'), "s_port": js.get('port'),
+                "uuid_remote": js.get('id'), "alter_id": js.get('aid', 0), "security": js.get('scy', 'auto'),
+                "net": js.get('net', 'tcp'), "type_header": js.get('type', 'none'),
+                "host": js.get('host', ''), "path": js.get('path', ''), "tls": js.get('tls', ''), "sni": js.get('sni', '')
+            })
+            return base
+        except Exception as e: raise Exception(f"VMess解析失败: {str(e)}")
     else: raise Exception("不支持协议 "+scheme)
 
 def get_next_port(rules):
@@ -354,7 +378,7 @@ cat > "$WORK_DIR/templates/index.html" <<'HTML_EOF'
 <body><div class="container py-5"><div class="card shadow mb-4"><div class="card-header bg-white"><h5 class="mb-0">🏠 本机直连节点</h5></div><div class="card-body"><div class="row g-3"><div class="col-md-6"><label class="small text-muted">VLESS (端口 10086)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-success fw-bold" value="{{ local_vless }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div><div class="col-md-6"><label class="small text-muted">Socks5 (端口 10087)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-primary fw-bold" value="{{ local_socks }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div></div></div></div>
 <div class="card shadow"><div class="card-header bg-white py-3 d-flex justify-content-between align-items-center"><h5 class="mb-0">📡 转发规则</h5><div><span class="badge bg-light text-dark border me-2">{{ username }}</span>{% if svc_status == 'running' %}<span class="status-ok fw-bold me-3">运行中 ✅</span>{% else %}<span class="status-err fw-bold me-3">已停止</span>{% endif %}<button class="btn btn-sm btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#pwdModal">改密</button><a href="/logout" class="btn btn-sm btn-outline-secondary">退出</a></div></div>
 {% if svc_status != 'running' %}<div class="alert alert-danger m-3"><pre class="mb-0">{{ svc_logs }}</pre></div>{% endif %}
-<div class="card-body"><form action="/add" method="POST" class="row g-2 mb-4 border-bottom pb-4"><div class="col-md-3"><input type="text" name="remark" class="form-control" placeholder="备注名" required></div><div class="col-md-7"><input type="text" name="sub_link" class="form-control" placeholder="支持 socks5://, vless://, hy2://" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary w-100">新增转发</button></div></form>
+<div class="card-body"><form action="/add" method="POST" class="row g-2 mb-4 border-bottom pb-4"><div class="col-md-3"><input type="text" name="remark" class="form-control" placeholder="备注名" required></div><div class="col-md-7"><input type="text" name="sub_link" class="form-control" placeholder="socks5://, vless://, hy2://, vmess://" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary w-100">新增转发</button></div></form>
 <table class="table table-hover align-middle"><thead><tr><th>备注</th><th>类型/IP</th><th>转发 VLESS / Socks5</th><th>操作</th></tr></thead><tbody>{% for r in rules %}<tr><td><span class="badge bg-secondary">{{ r.remark }}</span></td><td class="small"><span class="badge bg-info text-dark">{{ r.type|default('socks') }}</span><br>{{ r.s_ip }}</td><td><div class="input-group input-group-sm mb-1"><span class="input-group-text">VL :{{ r.port }}</span><input type="text" class="form-control" value="{{ r.link_vless }}" readonly onclick="this.select();document.execCommand('copy')"></div><div class="input-group input-group-sm"><span class="input-group-text">S5 :{{ r.socks_port }}</span><input type="text" class="form-control" value="{{ r.link_socks }}" readonly onclick="this.select();document.execCommand('copy')"></div></td><td><a href="/test/{{ r.id }}" target="_blank" class="btn btn-outline-info btn-sm">自检</a> <a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删</a></td></tr>{% endfor %}</tbody></table></div></div></div>
 <div class="modal fade" id="pwdModal"><div class="modal-dialog"><div class="modal-content"><form action="/update_password" method="POST"><div class="modal-header"><h5 class="modal-title">修改密码</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label>当前密码</label><input type="password" name="old_password" class="form-control" required></div><div class="mb-3"><label>新密码</label><input type="password" name="new_password" class="form-control" required></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">确认修改</button></div></form></div></div></div></body></html>
 HTML_EOF
