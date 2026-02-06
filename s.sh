@@ -49,6 +49,16 @@ WORK_DIR="/root/sbox-relay"
 mkdir -p "$WORK_DIR/templates"
 cd "$WORK_DIR"
 
+# Port Logic
+PORT_FILE="$WORK_DIR/.web_port"
+if [ -f "$PORT_FILE" ]; then
+    WEB_PORT=$(cat "$PORT_FILE")
+else
+    # 随机生成 10000-65000 端口
+    WEB_PORT=$(shuf -i 10000-65000 -n 1)
+    echo "$WEB_PORT" > "$PORT_FILE"
+fi
+
 KEY_FILE="$WORK_DIR/keys.conf"
 if [ -f "$KEY_FILE" ]; then
     echo "   ♻️  检测到旧密钥，正在恢复..."
@@ -363,7 +373,7 @@ if __name__ == '__main__':
     from waitress import serve
     update_firewall(0, "local_init")
     generate_sbox_config(load_data()) 
-    serve(app, host='0.0.0.0', port=5000)
+    serve(app, host='0.0.0.0', port=${WEB_PORT})
 EOF
 
 echo ">>> [6/8] 前端页面 (使用 v3.2 模板)..."
@@ -409,7 +419,7 @@ EOF
 touch /var/log/sing-box.log; chmod 666 /var/log/sing-box.log || true
 
 echo ">>> [8/8] 放行端口..."
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow 5000/tcp >/dev/null 2>&1 || true; else if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p tcp --dport 5000 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 5000 -j ACCEPT; fi; fi
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow ${WEB_PORT}/tcp >/dev/null 2>&1 || true; else if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p tcp --dport ${WEB_PORT} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport ${WEB_PORT} -j ACCEPT; fi; fi
 
 systemctl daemon-reload; systemctl enable sbox-web sing-box >/dev/null 2>&1; systemctl restart sbox-web sing-box
 IP=$(curl -s ifconfig.me || echo "$HOST_IP")
@@ -419,5 +429,5 @@ netstat -nlp | grep sing-box | awk '{print "    " $4 "\t(PID " $7 ")"}'
 echo "👉 您的永久一键脚本命令 (已包含依赖安装): "
 echo "apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')"
 echo ""
-echo "🌐 管理面板: http://${IP}:5000"
+echo "🌐 管理面板: http://${IP}:${WEB_PORT}"
 echo "🔐 首次登录时的用户名和密码为自定义（即首次访问时设置）"
