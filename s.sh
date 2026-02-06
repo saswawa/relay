@@ -73,6 +73,7 @@ import subprocess
 import uuid
 import base64
 import secrets
+import urllib.parse
 import time
 from functools import wraps
 from flask import Flask, render_template, request, redirect, session, url_for, flash
@@ -230,11 +231,31 @@ def generate_sbox_config(rules):
     
     for rule in rules:
         pv = int(rule['port']); ps = pv + 1
+        # Inbounds
         config['inbounds'].append({"type": "vless", "tag": f"in_vl_{pv}", "listen": "0.0.0.0", "listen_port": pv, "users": [{"uuid": rule['uuid'], "flow": "xtls-rprx-vision"}], "tls": {"enabled": True, "server_name": "www.microsoft.com", "reality": {"enabled": True, "handshake":{"server":"www.microsoft.com","server_port":443},"private_key":PRIVATE_KEY,"short_id":[SHORT_ID]}}})
         sb_in = {"type": "socks", "tag": f"in_sk_{ps}", "listen": "0.0.0.0", "listen_port": ps}; 
         if socks_users: sb_in["users"] = socks_users
         config['inbounds'].append(sb_in)
-        config['outbounds'].insert(0, {"type": "socks", "tag": f"out_{pv}", "server": rule['s_ip'], "server_port": int(rule['s_port']), "username": rule.get('s_user',''), "password": rule.get('s_pass','')})
+        
+        # Outbounds
+        otyp = rule.get('type', 'socks')
+        out = {"tag": f"out_{pv}"}
+        
+        if otyp == 'vless':
+            out.update({"type": "vless", "server": rule.get('server', rule.get('s_ip')), "server_port": int(rule.get('server_port', rule.get('s_port'))), "uuid": rule.get('uuid_remote'), "flow": rule.get('flow','')})
+            if rule.get('security') == 'reality':
+                out['tls'] = {"enabled": True, "server_name": rule.get('sni'), "utls": {"enabled": True, "fingerprint": rule.get('fp', 'chrome')}, "reality": {"enabled": True, "public_key": rule.get('pbk'), "short_id": rule.get('sid', '')}}
+            elif rule.get('security') == 'tls':
+                out['tls'] = {"enabled": True, "server_name": rule.get('sni'), "insecure": True}
+
+        elif otyp == 'hysteria2':
+            out.update({"type": "hysteria2", "server": rule.get('server', rule.get('s_ip')), "server_port": int(rule.get('server_port', rule.get('s_port'))), "password": rule.get('password',''), "tls": {"enabled": True, "server_name": rule.get('sni', rule.get('server', rule.get('s_ip'))), "insecure": rule.get('insecure', False)}})
+            if rule.get('obfs'): out['obfs'] = {"type": "salamander", "password": rule.get('obfs_password')}
+
+        else: # socks
+            out.update({"type": "socks", "server": rule['s_ip'], "server_port": int(rule['s_port']), "username": rule.get('s_user',''), "password": rule.get('s_pass','')})
+            
+        config['outbounds'].insert(0, out)
         config['route']['rules'].insert(0, {"inbound": [f"in_vl_{pv}", f"in_sk_{ps}"], "outbound": f"out_{pv}"})
 
     with open(SBOX_CONFIG, 'w') as f: json.dump(config, f, indent=2)
@@ -243,15 +264,26 @@ def generate_sbox_config(rules):
 # ... (rest same as v3.3) ...
 def parse_link(link):
     link = link.strip(); 
-    if not link.startswith("socks5://"):
+    if not link: raise Exception("为空")
+    if "://" not in link:
         try: link = base64.urlsafe_b64decode(link+"="*(-len(link)%4)).decode()
         except: pass
-    c = link.replace("socks5://", ""); u=p=h=pt=""
-    if "@" in c: a, h = c.split("@", 1); u, p = a.split(":", 1) if ":" in a else (a, "")
-    h = h.split("#")[0]
-    if ":" in h: h, pt = h.split(":", 1)
-    else: return {"s_ip":h, "s_port":0, "s_user":u, "s_pass":p}
-    return {"s_ip": h, "s_port": int(pt), "s_user": u, "s_pass": p}
+    
+    u = urllib.parse.urlparse(link); scheme = u.scheme.lower()
+    base = {"s_ip": u.hostname, "s_port": u.port, "server": u.hostname, "server_port": u.port}
+    
+    if scheme == 'socks5':
+        base.update({"type": "socks", "s_user": u.username or "", "s_pass": u.password or ""})
+        return base
+    elif scheme == 'vless':
+        q = urllib.parse.parse_qs(u.query)
+        base.update({"type": "vless", "uuid_remote": u.username, "flow": q.get('flow',[''])[0], "security": q.get('security',[''])[0], "sni": q.get('sni',[''])[0], "fp": q.get('fp',['chrome'])[0], "pbk": q.get('pbk',[''])[0], "sid": q.get('sid',[''])[0]})
+        return base
+    elif scheme == 'hy2' or scheme == 'hysteria2':
+        q = urllib.parse.parse_qs(u.query)
+        base.update({"type": "hysteria2", "password": u.username or "", "sni": q.get('sni', [u.hostname])[0], "insecure": q.get('insecure',['0'])[0]=='1', "obfs": q.get('obfs',[''])[0], "obfs_password": q.get('obfs-password',[''])[0]})
+        return base
+    else: raise Exception("不支持协议 "+scheme)
 
 def get_next_port(rules):
     used = [int(r['port']) for r in rules]
@@ -322,8 +354,8 @@ cat > "$WORK_DIR/templates/index.html" <<'HTML_EOF'
 <body><div class="container py-5"><div class="card shadow mb-4"><div class="card-header bg-white"><h5 class="mb-0">🏠 本机直连节点</h5></div><div class="card-body"><div class="row g-3"><div class="col-md-6"><label class="small text-muted">VLESS (端口 10086)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-success fw-bold" value="{{ local_vless }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div><div class="col-md-6"><label class="small text-muted">Socks5 (端口 10087)</label><div class="input-group input-group-sm"><input type="text" class="form-control text-primary fw-bold" value="{{ local_socks }}" readonly onclick="this.select();document.execCommand('copy')"><button class="btn btn-outline-secondary" onclick="this.previousElementSibling.click()">复制</button></div></div></div></div></div>
 <div class="card shadow"><div class="card-header bg-white py-3 d-flex justify-content-between align-items-center"><h5 class="mb-0">📡 转发规则</h5><div><span class="badge bg-light text-dark border me-2">{{ username }}</span>{% if svc_status == 'running' %}<span class="status-ok fw-bold me-3">运行中 ✅</span>{% else %}<span class="status-err fw-bold me-3">已停止</span>{% endif %}<button class="btn btn-sm btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#pwdModal">改密</button><a href="/logout" class="btn btn-sm btn-outline-secondary">退出</a></div></div>
 {% if svc_status != 'running' %}<div class="alert alert-danger m-3"><pre class="mb-0">{{ svc_logs }}</pre></div>{% endif %}
-<div class="card-body"><form action="/add" method="POST" class="row g-2 mb-4 border-bottom pb-4"><div class="col-md-3"><input type="text" name="remark" class="form-control" placeholder="备注名" required></div><div class="col-md-7"><input type="text" name="sub_link" class="form-control" placeholder="上游 Socks5 链接" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary w-100">新增转发</button></div></form>
-<table class="table table-hover align-middle"><thead><tr><th>备注</th><th>出口IP</th><th>转发 VLESS / Socks5</th><th>操作</th></tr></thead><tbody>{% for r in rules %}<tr><td><span class="badge bg-secondary">{{ r.remark }}</span></td><td class="small">{{ r.s_ip }}</td><td><div class="input-group input-group-sm mb-1"><span class="input-group-text">VL :{{ r.port }}</span><input type="text" class="form-control" value="{{ r.link_vless }}" readonly onclick="this.select();document.execCommand('copy')"></div><div class="input-group input-group-sm"><span class="input-group-text">S5 :{{ r.socks_port }}</span><input type="text" class="form-control" value="{{ r.link_socks }}" readonly onclick="this.select();document.execCommand('copy')"></div></td><td><a href="/test/{{ r.id }}" target="_blank" class="btn btn-outline-info btn-sm">自检</a> <a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删</a></td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="card-body"><form action="/add" method="POST" class="row g-2 mb-4 border-bottom pb-4"><div class="col-md-3"><input type="text" name="remark" class="form-control" placeholder="备注名" required></div><div class="col-md-7"><input type="text" name="sub_link" class="form-control" placeholder="支持 socks5://, vless://, hy2://" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary w-100">新增转发</button></div></form>
+<table class="table table-hover align-middle"><thead><tr><th>备注</th><th>类型/IP</th><th>转发 VLESS / Socks5</th><th>操作</th></tr></thead><tbody>{% for r in rules %}<tr><td><span class="badge bg-secondary">{{ r.remark }}</span></td><td class="small"><span class="badge bg-info text-dark">{{ r.type|default('socks') }}</span><br>{{ r.s_ip }}</td><td><div class="input-group input-group-sm mb-1"><span class="input-group-text">VL :{{ r.port }}</span><input type="text" class="form-control" value="{{ r.link_vless }}" readonly onclick="this.select();document.execCommand('copy')"></div><div class="input-group input-group-sm"><span class="input-group-text">S5 :{{ r.socks_port }}</span><input type="text" class="form-control" value="{{ r.link_socks }}" readonly onclick="this.select();document.execCommand('copy')"></div></td><td><a href="/test/{{ r.id }}" target="_blank" class="btn btn-outline-info btn-sm">自检</a> <a href="/del/{{ r.id }}" class="btn btn-outline-danger btn-sm">删</a></td></tr>{% endfor %}</tbody></table></div></div></div>
 <div class="modal fade" id="pwdModal"><div class="modal-dialog"><div class="modal-content"><form action="/update_password" method="POST"><div class="modal-header"><h5 class="modal-title">修改密码</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label>当前密码</label><input type="password" name="old_password" class="form-control" required></div><div class="mb-3"><label>新密码</label><input type="password" name="new_password" class="form-control" required></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">确认修改</button></div></form></div></div></div></body></html>
 HTML_EOF
 
@@ -360,5 +392,5 @@ IP=$(curl -s ifconfig.me || echo "$HOST_IP")
 echo ""; echo "✅ v3.4 链接优化版安装成功！"
 echo "🛠️  端口状态:"
 netstat -nlp | grep sing-box | awk '{print "    " $4 "\t(PID " $7 ")"}'
-echo "👉 您的永久一键脚本命令: "
-echo "bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')"
+echo "👉 您的永久一键脚本命令 (已包含依赖安装): "
+echo "apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')"
