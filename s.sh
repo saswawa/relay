@@ -418,3 +418,6 @@ echo "🛠️  端口状态:"
 netstat -nlp | grep sing-box | awk '{print "    " $4 "\t(PID " $7 ")"}'
 echo "👉 您的永久一键脚本命令 (已包含依赖安装): "
 echo "apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/saswawa/relay/main/s.sh | tr -d '\r')"
+echo ""
+echo "🌐 管理面板: http://${IP}:5000"
+echo "🔐 首次登录时的用户名和密码为自定义（即首次访问时设置）"
